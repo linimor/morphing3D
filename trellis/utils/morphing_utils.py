@@ -353,6 +353,7 @@ def run_morphing(pipeline, src_img, tar_img, morphing_params, seed, save_path, n
         for morphing_idx in range(1, morphing_params["morphing_num"] - 1):
             morphing_params["alpha"] = alpha_array[morphing_idx]
             morphing_params["morphing_idx"] = morphing_idx
+            # morphing_params["alpha"] = get_adaptive_alpha(morphing_params)
             morphing_params["tfsa_cache_idx"] = morphing_idx - 1
             morphing_params["tfsa_alpha"] = 0.8
             morphing_params["return_intermediate"]=True
@@ -594,4 +595,3 @@ def get_adaptive_alpha(morphing_params: dict) -> float:
         "step": step,
     }
     return float(np.clip(alpha, 0.0, 1.0))
-
