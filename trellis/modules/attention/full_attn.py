@@ -39,8 +39,6 @@ def _naive_sdpa(
     modify_max_passes: int = 4,
     modify_stop_conflict: float = 0.5,
     modify_temperature: float = 1.0,
-    gate_entropy_threshold: float = 6.0,
-    gate_max_logit_threshold: float = 1.0,
 ) -> torch.Tensor:
     q = q.permute(0, 2, 1, 3)
     k = k.permute(0, 2, 1, 3)
@@ -60,7 +58,7 @@ def _naive_sdpa(
     if gate_attn and gate_mode == "logits":
         entropy = -(attn_weight * torch.log(attn_weight + 1e-8)).sum(dim=-1, keepdim=True)
         max_logits = logits.max(dim=-1, keepdim=True).values
-        gate = ~((entropy > float(gate_entropy_threshold)) & (max_logits < float(gate_max_logit_threshold)))
+        gate = ~((entropy > 6.0) & (max_logits < 1.0))
         out = out * gate.to(out.dtype)
 
     out = out.permute(0, 2, 1, 3)
@@ -94,8 +92,6 @@ def scaled_dot_product_attention(*args, **kwargs):
     modify_max_passes = int(kwargs.get("modify_max_passes", 4))
     modify_stop_conflict = float(kwargs.get("modify_stop_conflict", 0.5))
     modify_temperature = float(kwargs.get("modify_temperature", 1.0))
-    gate_entropy_threshold = float(kwargs.get("gate_entropy_threshold", 6.0))
-    gate_max_logit_threshold = float(kwargs.get("gate_max_logit_threshold", 1.0))
     gate_qk_confidence_threshold = float(kwargs.get("gate_qk_confidence_threshold", 1.0))
 
     if num_args == 1:
@@ -123,8 +119,6 @@ def scaled_dot_product_attention(*args, **kwargs):
             modify_max_passes=modify_max_passes,
             modify_stop_conflict=modify_stop_conflict,
             modify_temperature=modify_temperature,
-            gate_entropy_threshold=gate_entropy_threshold,
-            gate_max_logit_threshold=gate_max_logit_threshold,
         )
 
     if BACKEND == "xformers":

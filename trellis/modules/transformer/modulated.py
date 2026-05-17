@@ -865,14 +865,10 @@ class ModulatedTransformerCrossBlock(nn.Module):
                 attn_kwargs = {
                     "modify": kwargs.get("modify", False),
                     "gate_attn": kwargs.get("gate_attn", False),
-                    "gate_mode": kwargs.get("gate_mode", "logits"),
                     "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
                     "modify_max_passes": kwargs.get("modify_max_passes", 4),
                     "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
                     "modify_temperature": kwargs.get("modify_temperature", 1.0),
-                    "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
-                    "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
-                    "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
                 }
                 h_src = self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx, **attn_kwargs)
                 h_tar = self.cross_attn(x=h, context=kwargs["tar_cond"], step_idx=step_idx, block_idx=block_idx, **attn_kwargs)

@@ -105,8 +105,12 @@ class SparseMultiHeadAttention(nn.Module):
         return qkv
     
     def forward(self, x: Union[SparseTensor, torch.Tensor], context: Optional[Union[SparseTensor, torch.Tensor]] = None, step_idx: int = 0, block_idx: int = 0, cache_idx: int = 0, **kwargs) -> Union[SparseTensor, torch.Tensor]:
-        sparse_modify = kwargs.get("sparse_modify", False)
-        sparse_gate_attn = kwargs.get("sparse_gate_attn", False)
+        sparse_modify = kwargs.get("sparse_modify", None)
+        if sparse_modify is None:
+            sparse_modify = kwargs.get("modify", False)
+        sparse_gate_attn = kwargs.get("sparse_gate_attn", None)
+        if sparse_gate_attn is None:
+            sparse_gate_attn = kwargs.get("gate_attn", False)
         full_attn_kwargs = {
             "modify": sparse_modify,
             "gate_attn": sparse_gate_attn,

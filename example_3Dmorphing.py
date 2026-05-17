@@ -1,6 +1,6 @@
 import os
+# os.environ['SPARSE_ATTN_BACKEND'] = 'naive'
 os.environ['ATTN_BACKEND'] = 'xformers'   # Can be 'flash-attn' or 'xformers', default is 'flash-attn'
-os.environ['SPARSE_ATTN_BACKEND'] = 'xformers'
 os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default is 'auto'.
                                             # 'auto' is faster but will do benchmarking at the beginning.
                                             # Recommended to set to 'native' if run only once.
@@ -18,8 +18,7 @@ src_img_path_list = []
 tar_img_path_list = []
 
 for tmp_name in [
-    ["Godzilla.png","bee.png"]
-    # ["typical_humanoid_goblin.png","typical_creature_dragon.png"],
+    ["Super_Big_Mech.png","typical_vehicle_pirate_ship.png"]
     # ["bee.png", "red_tree.png"],
     # ["Super_Big_Mech.png", "bee.png"],
     # ["0004.png", "3015.png"],
@@ -67,15 +66,14 @@ for idx in range(len(src_img_path_list)):
     if not os.path.exists(f"{tar_save_cache_path}/slat_init.pt"):
         run_morphing_cache(pipeline, tar_img, src_img, morphing_params, SEED, tar_save_path, tar_name)
 
-    # methods = ["CA_OC", "MAVF", "TOPO_REPAIR", "CGAR", "MCRF"]
-    methods = ["CGAR","CA_OC"]
+    methods = ["CA_OC", "MAVF", "TOPO_REPAIR", "CGAR", "MCRF"]
     method_name = "_".join(methods)
     name = src_name + "+" + tar_name + "_" + method_name
 
     morphing_params = build_morphing_params(
         methods,
         overrides={
-            "morphing_num": 25,
+            "morphing_num": 50,
             "src_load_cache_path": src_save_cache_path,
             "tar_load_cache_path": tar_save_cache_path,
         },

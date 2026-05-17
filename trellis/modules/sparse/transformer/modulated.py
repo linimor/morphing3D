@@ -164,8 +164,16 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         h = x.replace(self.norm2(x.feats))
 
         if len(kwargs) > 0:
-            if kwargs["slat_mca_flag"]:
-                h = slat_interp(self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx), self.cross_attn(x=h, context=kwargs["tar_cond"], step_idx=step_idx, block_idx=block_idx), alpha=kwargs["alpha"])
+            if kwargs.get("slat_mca_cond_fuse_flag", False):
+                alpha = kwargs.get("slat_mca_cond_fuse_alpha", kwargs.get("alpha", 0.5))
+                fused_context = feature_interp(context, kwargs["tar_cond"], alpha, interp_mode="linear")
+                h = self.cross_attn(x=h, context=fused_context, step_idx=step_idx, block_idx=block_idx, **kwargs)
+            elif kwargs["slat_mca_flag"]:
+                h = slat_interp(
+                    self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx, **kwargs),
+                    self.cross_attn(x=h, context=kwargs["tar_cond"], step_idx=step_idx, block_idx=block_idx, **kwargs),
+                    alpha=kwargs["alpha"],
+                )
             else:
                 h = self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx, **kwargs)
         else:

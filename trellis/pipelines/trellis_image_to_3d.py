@@ -29,9 +29,9 @@ os.environ["U2NET_PATH"] = "/root/autodl-tmp/MorphAny3D/u2net.onnx"
 
 MORPHING_ATTENTION_DEFAULTS = {
     "modify": False,
-    "sparse_modify": False,
+    "sparse_modify": None,
     "gate_attn": False,
-    "sparse_gate_attn": False,
+    "sparse_gate_attn": None,
     "gate_mode": "logits",
     "modify_mode": "legacy",
     "modify_precheck": False,
@@ -550,10 +550,7 @@ class TrellisImageTo3DPipeline(Pipeline):
             src_noise = torch.load(os.path.join(morphing_params["src_load_cache_path"], "coords_zs_init.pt")).to(self.device)
             tar_noise = torch.load(os.path.join(morphing_params["tar_load_cache_path"], "coords_zs_init.pt")).to(self.device)
             noise = feature_interp(src_noise, tar_noise, morphing_params["alpha"])
-        explicit_sampler_params = dict(sampler_params)
-        sampler_params = {**self.sparse_structure_sampler_params, **explicit_sampler_params}
-        if "ss_steps" in morphing_params and "steps" not in explicit_sampler_params:
-            sampler_params["steps"] = int(morphing_params["ss_steps"])
+        sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         sampler_kwargs = dict(morphing_params)
         sampler_kwargs["ss_num_steps"] = sampler_params.get("steps", sampler_kwargs.get("ss_num_steps", None))
         sampler_kwargs["ss_token_grid_size"] = getattr(flow_model, "resolution", reso) // getattr(flow_model, "patch_size", 1)

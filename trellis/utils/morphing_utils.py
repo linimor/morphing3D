@@ -369,7 +369,11 @@ def run_morphing(pipeline, src_img, tar_img, morphing_params, seed, save_path, n
             mesh_video_list.append(np.stack(render_utils.render_rot_video(outputs['mesh'][0], bg_color=bg_color)['normal'], axis=0))
 
             if morphing_params["rm_cache"]:
-                files = glob(f"{morphing_params['save_cache_path']}/ss_sa_morphing{morphing_params['tfsa_cache_idx']}_*") + glob(f"{morphing_params['save_cache_path']}/slat_sa_morphing{morphing_params['tfsa_cache_idx']}_*")
+                files = (
+                    glob(f"{morphing_params['save_cache_path']}/ss_sa_morphing{morphing_params['tfsa_cache_idx']}_*")
+                    + glob(f"{morphing_params['save_cache_path']}/slat_sa_morphing{morphing_params['tfsa_cache_idx']}_*")
+                    + glob(f"{morphing_params['save_cache_path']}/ss_ca_oc_morphing{morphing_params['tfsa_cache_idx']}_*")
+                )
                 for f in files:
                     os.remove(f)
 

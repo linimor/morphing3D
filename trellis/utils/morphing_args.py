@@ -4,10 +4,6 @@ from typing import Iterable, Mapping, Optional
 
 BASE_MORPHING_PARAMS = {
     "init_morphing_flag": False,
-    # Sparse-structure sampling steps. This maps to the SS sampler's `steps`
-    # argument unless `sparse_structure_sampler_params["steps"]` is explicitly
-    # provided at the pipeline call site.
-    "ss_steps": 25,
     "ss_mca_flag": True,
     "slat_mca_flag": True,
     "ss_tfsa_flag": True,
@@ -16,51 +12,11 @@ BASE_MORPHING_PARAMS = {
 }
 
 
-# Legacy attention modify_attn_score(...) parameter surface.
-#
-# These keys are consumed by:
-# - dense attention: trellis/modules/attention/full_attn.py
-# - sparse attention: trellis/modules/sparse/attention/full_attn.py
-#
-# The actual enable switch stays in each method preset (`modify=True/False`).
-# This dict only lists the parameters passed into modify_attn_score(...).
-ATTENTION_MODIFY_DEFAULTS = {
-    # Sparse attention did not consume modify in version 77. Keep it opt-in so
-    # old CGAR parameters do not change SLAT/sparse attention behavior.
-    "sparse_modify": False,
-    # Penalize losing queries that crowd the same top-1 key.
-    "modify_lambda_scale": 3,
-    # Maximum number of conflict-reduction passes.
-    "modify_max_passes": 12,
-    # Stop once average top-1 key overload is at or below this value.
-    "modify_stop_conflict": 0.5,
-    # Kept for API completeness. The current modify_attn_score implementation
-    # accepts this argument but does not use it internally.
-}
-
-
-ATTENTION_GATE_DEFAULTS = {
-    # Sparse attention did not consume gate_attn in version 77. Keep it opt-in.
-    "sparse_gate_attn": False,
-    # Gate placement:
-    # - "logits": gate in the native logits/probability path.
-    # - "post": gate the attention output after xformers/flash/sdpa returns.
-    "gate_mode": "logits",
-    # Used by gate_mode="logits": suppress high-entropy, low-max-logit outputs.
-    "gate_entropy_threshold": 6.0,
-    "gate_max_logit_threshold": 1.0,
-    # Used by gate_mode="post": q/k confidence threshold for output gating.
-    "gate_qk_confidence_threshold": 1.0,
-}
-
-
 METHOD_PRESETS = {
     "CGAR": {
-        **ATTENTION_MODIFY_DEFAULTS,
-        **ATTENTION_GATE_DEFAULTS,
         "modify": True,
         "gate_attn": True,
-        "sa_use": True,
+        "sa_use": False,
         "modify_lambda_scale": 0.8,
     },
     "MCRF": {

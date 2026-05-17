@@ -2,6 +2,7 @@ from typing import *
 import torch
 from .. import SparseTensor
 from .. import DEBUG, ATTN
+from ...attn_modify import apply_qk_output_gate, apply_sink_cap, apply_sink_penalty, modify_attn_score, qk_sink_precheck
 
 if ATTN == 'xformers':
     import xformers.ops as xops
@@ -28,6 +29,21 @@ def _native_varlen_attention_with_probs(
     *,
     scale: Optional[float] = None,
     return_probs: bool = True,
+    modify: bool = False,
+    gate_attn: bool = False,
+    gate_mode: str = "logits",
+    modify_mode: str = "legacy",
+    modify_lambda_scale: float = 0.3,
+    modify_max_passes: int = 4,
+    modify_stop_conflict: float = 0.5,
+    modify_temperature: float = 1.0,
+    modify_sink_threshold: float = 0.15,
+    modify_sink_top_count_weight: float = 0.5,
+    modify_sink_mass_weight: float = 0.5,
+    modify_sink_penalty_type: str = "linear",
+    modify_sink_cap_iters: int = 4,
+    gate_entropy_threshold: float = 6.0,
+    gate_max_logit_threshold: float = 1.0,
 ) -> Tuple[torch.Tensor, Optional[List]]:
     """
     Native variable-length full attention.
@@ -71,12 +87,41 @@ def _native_varlen_attention_with_probs(
 
         # scores: [H, Lq, Lk]
         scores = torch.matmul(q_i, k_i.transpose(-2, -1)) * attn_scale
-
-        # probs: [H, Lq, Lk]
-        probs = torch.softmax(scores, dim=-1)
+        if modify:
+            if modify_mode == "sink_cap":
+                scores, probs = apply_sink_cap(
+                    scores,
+                    cap=modify_sink_threshold,
+                    max_iters=modify_sink_cap_iters,
+                )
+            elif modify_mode == "sink_penalty":
+                scores, probs = apply_sink_penalty(
+                    scores,
+                    lambda_scale=modify_lambda_scale,
+                    threshold=modify_sink_threshold,
+                    top_count_weight=modify_sink_top_count_weight,
+                    mass_weight=modify_sink_mass_weight,
+                    penalty_type=modify_sink_penalty_type,
+                )
+            else:
+                scores = modify_attn_score(
+                    scores.unsqueeze(0),
+                    lambda_scale=modify_lambda_scale,
+                    max_passes=modify_max_passes,
+                    stop_conflict=modify_stop_conflict,
+                    temperature=modify_temperature,
+                ).squeeze(0)
+                probs = torch.softmax(scores, dim=-1)
+        else:
+            probs = torch.softmax(scores, dim=-1)
 
         # out_i: [H, Lq, Co]
         out_i = torch.matmul(probs, v_i)
+        if gate_attn and gate_mode == "logits":
+            entropy = -(probs.float() * torch.log(probs.float() + 1e-8)).sum(dim=-1, keepdim=True)
+            max_logits = scores.float().max(dim=-1, keepdim=True).values
+            gate = ~((entropy > float(gate_entropy_threshold)) & (max_logits < float(gate_max_logit_threshold)))
+            out_i = out_i * gate.to(out_i.dtype)
 
         # -> [Lq, H, Co]
         out_i = out_i.permute(1, 0, 2).contiguous()
@@ -169,6 +214,26 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         3: ['q', 'k', 'v']
     }
     return_score = kwargs.get("return_score", False)
+    modify = bool(kwargs.get("modify", False))
+    gate_attn = bool(kwargs.get("gate_attn", False))
+    gate_mode = str(kwargs.get("gate_mode", "logits"))
+    modify_mode = str(kwargs.get("modify_mode", "legacy"))
+    modify_precheck = bool(kwargs.get("modify_precheck", False))
+    modify_precheck_threshold = float(kwargs.get("modify_precheck_threshold", 2.5))
+    modify_precheck_min_query_tokens = int(kwargs.get("modify_precheck_min_query_tokens", 64))
+    modify_precheck_min_key_tokens = int(kwargs.get("modify_precheck_min_key_tokens", 64))
+    modify_lambda_scale = float(kwargs.get("modify_lambda_scale", 0.3))
+    modify_max_passes = int(kwargs.get("modify_max_passes", 4))
+    modify_stop_conflict = float(kwargs.get("modify_stop_conflict", 0.5))
+    modify_temperature = float(kwargs.get("modify_temperature", 1.0))
+    modify_sink_threshold = float(kwargs.get("modify_sink_threshold", 0.15))
+    modify_sink_top_count_weight = float(kwargs.get("modify_sink_top_count_weight", 0.5))
+    modify_sink_mass_weight = float(kwargs.get("modify_sink_mass_weight", 0.5))
+    modify_sink_penalty_type = str(kwargs.get("modify_sink_penalty_type", "linear"))
+    modify_sink_cap_iters = int(kwargs.get("modify_sink_cap_iters", 4))
+    gate_entropy_threshold = float(kwargs.get("gate_entropy_threshold", 6.0))
+    gate_max_logit_threshold = float(kwargs.get("gate_max_logit_threshold", 1.0))
+    gate_qk_confidence_threshold = float(kwargs.get("gate_qk_confidence_threshold", 1.0))
     probs_list=None
     num_all_args = len(args) # + len(kwargs)
     assert num_all_args in arg_names_dict, f"Invalid number of arguments, got {num_all_args}, expected 1, 2, or 3"
@@ -262,36 +327,113 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         if num_all_args == 3:
             assert k.shape[:2] == [1, sum(kv_seqlen)], f"SparseScaledDotProductSelfAttention: k shape mismatch"
             assert v.shape[:2] == [1, sum(kv_seqlen)], f"SparseScaledDotProductSelfAttention: v shape mismatch"
-    if return_score:
+    run_native = return_score or modify or (gate_attn and gate_mode == "logits")
+    if modify and modify_precheck:
+        if num_all_args == 1:
+            q_precheck, k_precheck = qkv[:, 0], qkv[:, 1]
+        elif num_all_args == 2:
+            q_precheck, k_precheck = q, kv[:, 0]
+        else:
+            q_precheck, k_precheck = q, k
+        run_native = return_score or (gate_attn and gate_mode == "logits") or qk_sink_precheck(
+            q_precheck,
+            k_precheck,
+            q_seqlen,
+            kv_seqlen,
+            threshold=modify_precheck_threshold,
+            min_query_tokens=modify_precheck_min_query_tokens,
+            min_key_tokens=modify_precheck_min_key_tokens,
+        )
+        modify = run_native and modify
+
+    if run_native:
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
         out, probs_list = _native_varlen_attention_with_probs(
-        q=q,
-        k=k,
-        v=v,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        return_probs=return_score,
-    )
+            q=q,
+            k=k,
+            v=v,
+            q_seqlen=q_seqlen,
+            kv_seqlen=kv_seqlen,
+            return_probs=return_score,
+            modify=modify,
+            gate_attn=gate_attn,
+            gate_mode=gate_mode,
+            modify_mode=modify_mode,
+            modify_lambda_scale=modify_lambda_scale,
+            modify_max_passes=modify_max_passes,
+            modify_stop_conflict=modify_stop_conflict,
+            modify_temperature=modify_temperature,
+            modify_sink_threshold=modify_sink_threshold,
+            modify_sink_top_count_weight=modify_sink_top_count_weight,
+            modify_sink_mass_weight=modify_sink_mass_weight,
+            modify_sink_penalty_type=modify_sink_penalty_type,
+            modify_sink_cap_iters=modify_sink_cap_iters,
+            gate_entropy_threshold=gate_entropy_threshold,
+            gate_max_logit_threshold=gate_max_logit_threshold,
+        )
     else:
         if ATTN == 'xformers':
             if num_all_args == 1:
                 q, k, v = qkv.unbind(dim=1)
             elif num_all_args == 2:
                 k, v = kv.unbind(dim=1)
+            q_flat, k_flat = q, k
             q = q.unsqueeze(0)
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
             mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
             out = xops.memory_efficient_attention(q, k, v, mask)[0]
+            if gate_attn and gate_mode == "post":
+                out = apply_qk_output_gate(
+                    out,
+                    q_flat,
+                    k_flat,
+                    q_seqlen,
+                    kv_seqlen,
+                    confidence_threshold=gate_qk_confidence_threshold,
+                )
         elif ATTN == 'flash_attn':
             cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
             if num_all_args in [2, 3]:
                 cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
             if num_all_args == 1:
                 out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens_q, max(q_seqlen))
+                if gate_attn and gate_mode == "post":
+                    q_gate, k_gate, _ = qkv.unbind(dim=1)
+                    out = apply_qk_output_gate(
+                        out,
+                        q_gate,
+                        k_gate,
+                        q_seqlen,
+                        kv_seqlen,
+                        confidence_threshold=gate_qk_confidence_threshold,
+                    )
             elif num_all_args == 2:
                 out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+                if gate_attn and gate_mode == "post":
+                    k_gate, _ = kv.unbind(dim=1)
+                    out = apply_qk_output_gate(
+                        out,
+                        q,
+                        k_gate,
+                        q_seqlen,
+                        kv_seqlen,
+                        confidence_threshold=gate_qk_confidence_threshold,
+                    )
             elif num_all_args == 3:
                 out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+                if gate_attn and gate_mode == "post":
+                    out = apply_qk_output_gate(
+                        out,
+                        q,
+                        k,
+                        q_seqlen,
+                        kv_seqlen,
+                        confidence_threshold=gate_qk_confidence_threshold,
+                    )
         else:
             raise ValueError(f"Unknown attention module: {ATTN}")
     
