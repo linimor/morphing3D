@@ -65,8 +65,8 @@ if [ "$HELP" = true ] ; then
 fi
 
 if [ "$NEW_ENV" = true ] ; then
-    conda create -n morphany3d python=3.10
-    conda activate morphany3d
+    conda create -n reinmorph3d python=3.10
+    conda activate reinmorph3d
     conda install pytorch==2.4.0 torchvision==0.19.0 pytorch-cuda=11.8 -c pytorch -c nvidia
 fi
 

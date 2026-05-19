@@ -4,6 +4,7 @@ import math
 import torch
 
 from . import BACKEND
+from ..attn_modify import apply_qk_output_gate, modify_attn_score
 
 if BACKEND == "xformers":
     import xformers.ops as xops
@@ -20,44 +21,6 @@ else:
 __all__ = ["scaled_dot_product_attention", "modify_attn_score"]
 
 
-def modify_attn_score(
-    attn_score: torch.Tensor,
-    lambda_scale: float = 0.3,
-    max_passes: int = 4,
-    stop_conflict: float = 0.5,
-) -> torch.Tensor:
-    """Reduce many-query-to-one-key conflicts in raw attention logits."""
-    score = attn_score.float().clone()
-    dtype = attn_score.dtype
-    bsz, heads, query_len, key_len = score.shape
-    flat = score.reshape(bsz * heads, query_len, key_len)
-
-    for _ in range(max(int(max_passes), 0)):
-        best_val, best_key = flat.max(dim=-1)
-        counts = torch.zeros(flat.shape[0], key_len, device=flat.device, dtype=flat.dtype)
-        counts.scatter_add_(1, best_key, torch.ones_like(best_val))
-        overload = torch.relu(counts - 1.0)
-        if float(overload.sum(dim=1).mean()) <= float(stop_conflict):
-            break
-
-        winner = torch.full_like(counts, -torch.inf)
-        winner.scatter_reduce_(1, best_key, best_val, reduce="amax", include_self=True)
-        winner_for_query = winner.gather(1, best_key)
-        crowd_for_query = overload.gather(1, best_key)
-        loser = (counts.gather(1, best_key) > 1) & (best_val < winner_for_query) & (best_val > 0)
-        if not bool(loser.any()):
-            break
-
-        loser_idx = loser.nonzero(as_tuple=False)
-        m_idx, q_idx = loser_idx[:, 0], loser_idx[:, 1]
-        k_idx = best_key[m_idx, q_idx]
-        cur = flat[m_idx, q_idx, k_idx]
-        penalty = float(lambda_scale) * (1.0 + crowd_for_query[m_idx, q_idx]) * winner_for_query[m_idx, q_idx]
-        flat[m_idx, q_idx, k_idx] = torch.clamp(cur - penalty, min=0.0)
-
-    return flat.reshape(bsz, heads, query_len, key_len).to(dtype)
-
-
 def _score_from_attention(attn_weight: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     score_per_head = attn_weight.max(dim=-1).values.permute(0, 2, 1)
     head_weight = torch.softmax(out.norm(dim=-1), dim=-1)
@@ -71,21 +34,33 @@ def _naive_sdpa(
     return_score: bool = False,
     modify: bool = False,
     gate_attn: bool = False,
+    gate_mode: str = "logits",
     modify_lambda_scale: float = 0.3,
+    modify_max_passes: int = 4,
+    modify_stop_conflict: float = 0.5,
+    modify_temperature: float = 1.0,
+    gate_entropy_threshold: float = 6.0,
+    gate_max_logit_threshold: float = 1.0,
 ) -> torch.Tensor:
     q = q.permute(0, 2, 1, 3)
     k = k.permute(0, 2, 1, 3)
     v = v.permute(0, 2, 1, 3)
     logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.shape[-1])
     if modify:
-        logits = modify_attn_score(logits, lambda_scale=modify_lambda_scale)
+        logits = modify_attn_score(
+            logits,
+            lambda_scale=modify_lambda_scale,
+            max_passes=modify_max_passes,
+            stop_conflict=modify_stop_conflict,
+            temperature=modify_temperature,
+        )
     attn_weight = torch.softmax(logits, dim=-1)
     out = torch.matmul(attn_weight, v)
 
-    if gate_attn:
+    if gate_attn and gate_mode == "logits":
         entropy = -(attn_weight * torch.log(attn_weight + 1e-8)).sum(dim=-1, keepdim=True)
         max_logits = logits.max(dim=-1, keepdim=True).values
-        gate = ~((entropy > 6.0) & (max_logits < 1.0))
+        gate = ~((entropy > float(gate_entropy_threshold)) & (max_logits < float(gate_max_logit_threshold)))
         out = out * gate.to(out.dtype)
 
     out = out.permute(0, 2, 1, 3)
@@ -114,7 +89,14 @@ def scaled_dot_product_attention(*args, **kwargs):
     return_score = bool(kwargs.get("return_score", False))
     modify = bool(kwargs.get("modify", False))
     gate_attn = bool(kwargs.get("gate_attn", False))
+    gate_mode = str(kwargs.get("gate_mode", "logits"))
     modify_lambda_scale = float(kwargs.get("modify_lambda_scale", 0.3))
+    modify_max_passes = int(kwargs.get("modify_max_passes", 4))
+    modify_stop_conflict = float(kwargs.get("modify_stop_conflict", 0.5))
+    modify_temperature = float(kwargs.get("modify_temperature", 1.0))
+    gate_entropy_threshold = float(kwargs.get("gate_entropy_threshold", 6.0))
+    gate_max_logit_threshold = float(kwargs.get("gate_max_logit_threshold", 1.0))
+    gate_qk_confidence_threshold = float(kwargs.get("gate_qk_confidence_threshold", 1.0))
 
     if num_args == 1:
         qkv = args[0]
@@ -128,7 +110,7 @@ def scaled_dot_product_attention(*args, **kwargs):
         q, k, v = args
         assert q.ndim == k.ndim == v.ndim == 4
 
-    if return_score or modify or gate_attn or BACKEND == "naive":
+    if return_score or modify or (gate_attn and gate_mode == "logits") or BACKEND == "naive":
         return _naive_sdpa(
             q,
             k,
@@ -136,18 +118,61 @@ def scaled_dot_product_attention(*args, **kwargs):
             return_score=return_score,
             modify=modify,
             gate_attn=gate_attn,
+            gate_mode=gate_mode,
             modify_lambda_scale=modify_lambda_scale,
+            modify_max_passes=modify_max_passes,
+            modify_stop_conflict=modify_stop_conflict,
+            modify_temperature=modify_temperature,
+            gate_entropy_threshold=gate_entropy_threshold,
+            gate_max_logit_threshold=gate_max_logit_threshold,
         )
 
     if BACKEND == "xformers":
-        return xops.memory_efficient_attention(q, k, v)
+        out = xops.memory_efficient_attention(q, k, v)
+        if gate_attn and gate_mode == "post":
+            n, lq = q.shape[:2]
+            lkv = k.shape[1]
+            out = apply_qk_output_gate(
+                out.reshape(n * lq, *out.shape[2:]),
+                q.reshape(n * lq, *q.shape[2:]),
+                k.reshape(n * lkv, *k.shape[2:]),
+                [lq] * n,
+                [lkv] * n,
+                confidence_threshold=gate_qk_confidence_threshold,
+            ).reshape_as(out)
+        return out
     if BACKEND == "flash_attn":
         if num_args == 1:
-            return flash_attn.flash_attn_qkvpacked_func(args[0])
+            out = flash_attn.flash_attn_qkvpacked_func(args[0])
         if num_args == 2:
-            return flash_attn.flash_attn_kvpacked_func(q, args[1])
-        return flash_attn.flash_attn_func(q, k, v)
+            out = flash_attn.flash_attn_kvpacked_func(q, args[1])
+        if num_args == 3:
+            out = flash_attn.flash_attn_func(q, k, v)
+        if gate_attn and gate_mode == "post":
+            n, lq = q.shape[:2]
+            lkv = k.shape[1]
+            out = apply_qk_output_gate(
+                out.reshape(n * lq, *out.shape[2:]),
+                q.reshape(n * lq, *q.shape[2:]),
+                k.reshape(n * lkv, *k.shape[2:]),
+                [lq] * n,
+                [lkv] * n,
+                confidence_threshold=gate_qk_confidence_threshold,
+            ).reshape_as(out)
+        return out
     if BACKEND == "sdpa":
         out = sdpa(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3))
-        return out.permute(0, 2, 1, 3)
+        out = out.permute(0, 2, 1, 3)
+        if gate_attn and gate_mode == "post":
+            n, lq = q.shape[:2]
+            lkv = k.shape[1]
+            out = apply_qk_output_gate(
+                out.reshape(n * lq, *out.shape[2:]),
+                q.reshape(n * lq, *q.shape[2:]),
+                k.reshape(n * lkv, *k.shape[2:]),
+                [lq] * n,
+                [lkv] * n,
+                confidence_threshold=gate_qk_confidence_threshold,
+            ).reshape_as(out)
+        return out
     raise ValueError(f"Unknown attention backend: {BACKEND}")

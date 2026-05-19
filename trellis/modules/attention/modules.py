@@ -118,14 +118,28 @@ class MultiHeadAttention(nn.Module):
             self_attn_kwargs = {
                 "modify": kwargs.get("modify", False),
                 "gate_attn": kwargs.get("gate_attn", False),
+                "gate_mode": kwargs.get("gate_mode", "logits"),
                 "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
+                "modify_max_passes": kwargs.get("modify_max_passes", 4),
+                "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
+                "modify_temperature": kwargs.get("modify_temperature", 1.0),
+                "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
+                "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
+                "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
             }
         attn_kwargs = {}
         if self._type == "cross":
             attn_kwargs = {
                 "modify": kwargs.get("modify", False),
                 "gate_attn": kwargs.get("gate_attn", False),
+                "gate_mode": kwargs.get("gate_mode", "logits"),
                 "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
+                "modify_max_passes": kwargs.get("modify_max_passes", 4),
+                "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
+                "modify_temperature": kwargs.get("modify_temperature", 1.0),
+                "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
+                "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
+                "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
             }
         if self._type == "self":
             if len(kwargs) > 0:
@@ -136,10 +150,13 @@ class MultiHeadAttention(nn.Module):
                         if not os.path.exists(f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt"):
                             torch.save({"k": qkv[0, :, 1,  :, :].detach().cpu(), "v": qkv[0, :, 2,  :, :].detach().cpu()}, f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt")
                     elif cache_idx == -1:
-                        if os.path.exists(f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt"):
-                            cache = torch.load(f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt")
+                        cache_path = f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt"
+                        if os.path.exists(cache_path):
+                            cache = torch.load(cache_path)
                             qkv[:, :, 1, :, :] = cache["k"].to(qkv.device) 
                             qkv[:, :, 2, :, :] = cache["v"].to(qkv.device)
+                            if kwargs.get("delete_loaded_tfsa_cache", False):
+                                os.remove(cache_path)
 
                 if self.use_rope:
                     q, k, v = qkv.unbind(dim=2)

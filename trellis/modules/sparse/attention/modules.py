@@ -105,6 +105,31 @@ class SparseMultiHeadAttention(nn.Module):
         return qkv
     
     def forward(self, x: Union[SparseTensor, torch.Tensor], context: Optional[Union[SparseTensor, torch.Tensor]] = None, step_idx: int = 0, block_idx: int = 0, cache_idx: int = 0, **kwargs) -> Union[SparseTensor, torch.Tensor]:
+        sparse_modify = kwargs.get("sparse_modify", False)
+        sparse_gate_attn = kwargs.get("sparse_gate_attn", False)
+        full_attn_kwargs = {
+            "modify": sparse_modify,
+            "gate_attn": sparse_gate_attn,
+            "gate_mode": kwargs.get("gate_mode", "logits"),
+            "modify_mode": kwargs.get("modify_mode", "legacy"),
+            "modify_precheck": kwargs.get("modify_precheck", False),
+            "modify_precheck_threshold": kwargs.get("modify_precheck_threshold", 2.5),
+            "modify_precheck_min_query_tokens": kwargs.get("modify_precheck_min_query_tokens", 64),
+            "modify_precheck_min_key_tokens": kwargs.get("modify_precheck_min_key_tokens", 64),
+            "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
+            "modify_max_passes": kwargs.get("modify_max_passes", 4),
+            "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
+            "modify_temperature": kwargs.get("modify_temperature", 1.0),
+            "modify_sink_threshold": kwargs.get("modify_sink_threshold", 0.15),
+            "modify_sink_top_count_weight": kwargs.get("modify_sink_top_count_weight", 0.5),
+            "modify_sink_mass_weight": kwargs.get("modify_sink_mass_weight", 0.5),
+            "modify_sink_penalty_type": kwargs.get("modify_sink_penalty_type", "linear"),
+            "modify_sink_cap_iters": kwargs.get("modify_sink_cap_iters", 4),
+            "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
+            "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
+            "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
+        }
+
         if self._type == "self":
             split_flag = False
             if len(kwargs) > 0:
@@ -117,14 +142,17 @@ class SparseMultiHeadAttention(nn.Module):
                         if not os.path.exists(f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['morphing_idx']}.pt"):
                             torch.save(x.coords.detach().cpu(), f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['morphing_idx']}.pt")
                     elif cache_idx == -1:
-                        if os.path.exists(f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt"):
+                        cache_path = f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt"
+                        if os.path.exists(cache_path):
                             split_flag = True
-                            cache = torch.load(f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt")
+                            cache = torch.load(cache_path)
                             cache_coords = torch.load(f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['tfsa_cache_idx']}.pt")
                             kv_feats = torch.cat([cache["k"][:, None], cache["v"][:, None]], dim=1).to(x.feats.device)
                             kv_coords = cache_coords.to(x.coords.device)
                             q = qkv.replace(qkv.feats[:, 0, :, :])
                             kv = SparseTensor(feats=kv_feats, coords=kv_coords)
+                            if kwargs.get("delete_loaded_tfsa_cache", False):
+                                os.remove(cache_path)
             else:
                 qkv = self._linear(self.to_qkv, x)
                 qkv = self._fused_pre(qkv, num_fused=3)
@@ -139,7 +167,7 @@ class SparseMultiHeadAttention(nn.Module):
                     kv = kv.replace(torch.stack([k.feats, v.feats], dim=1))
 
                 if self.attn_mode == "full":
-                    h = sparse_scaled_dot_product_attention(q, kv)
+                    h = sparse_scaled_dot_product_attention(q, kv, **full_attn_kwargs)
                 elif self.attn_mode == "serialized":
                     h = sparse_serialized_scaled_dot_product_self_attention(
                         qkv, self.window_size, serialize_mode=self.serialize_mode, shift_sequence=self.shift_sequence, shift_window=self.shift_window
@@ -158,7 +186,7 @@ class SparseMultiHeadAttention(nn.Module):
                     qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
 
                 if self.attn_mode == "full":
-                    h = sparse_scaled_dot_product_attention(qkv)
+                    h = sparse_scaled_dot_product_attention(qkv, **full_attn_kwargs)
                 elif self.attn_mode == "serialized":
                     h = sparse_serialized_scaled_dot_product_self_attention(
                         qkv, self.window_size, serialize_mode=self.serialize_mode, shift_sequence=self.shift_sequence, shift_window=self.shift_window
@@ -179,7 +207,7 @@ class SparseMultiHeadAttention(nn.Module):
                 k = self.k_rms_norm(k)
                 kv = kv.replace(torch.stack([k.feats, v.feats], dim=1))
            
-            h = sparse_scaled_dot_product_attention(q, kv)
+            h = sparse_scaled_dot_product_attention(q, kv, **full_attn_kwargs)
 
         h = self._reshape_chs(h, (-1,))
         h = self._linear(self.to_out, h)
