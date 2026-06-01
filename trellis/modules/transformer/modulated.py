@@ -13,6 +13,7 @@ from ...utils.ot_coherence import (
     get_ss_token_positions,
     ot_motion_coherent_filter,
 )
+from ...utils.pre_fusion_dplc import pre_fusion_dplc
 
 
 def _ss_ca_oc_cache_path(kwargs: dict, cache_idx: int, step_idx: int, block_idx: int) -> Optional[str]:
@@ -23,6 +24,19 @@ def _ss_ca_oc_cache_path(kwargs: dict, cache_idx: int, step_idx: int, block_idx:
         save_cache_path,
         f"ss_ca_oc_morphing{cache_idx}_step{step_idx}_block{block_idx}.pt",
     )
+
+
+def _use_modify_this_step(kwargs: dict, step_idx: int) -> bool:
+    if not kwargs.get("modify", False):
+        return False
+    start = kwargs.get("modify_start_step", 0)
+    end = kwargs.get("modify_end_step", None)
+    stride = max(int(kwargs.get("modify_step_stride", 1)), 1)
+    if start is not None and step_idx < int(start):
+        return False
+    if end is not None and step_idx > int(end):
+        return False
+    return (int(step_idx) - int(start or 0)) % stride == 0
 
 
 def _load_ss_endpoint_occ16(kwargs: dict, tag: str) -> Optional[dict]:
@@ -115,13 +129,22 @@ def _ss_ca_oc_align_pair(
     prev_idx = kwargs.get("tfsa_cache_idx", None)
     src_k = 0
     tar_k = 0
+    cache_mode = kwargs.get("ca_oc_cache_mode", kwargs.get("tfsa_cache_mode", "disk"))
+    memory_cache = kwargs.get("_ca_oc_memory_cache", None)
+    ref = None
+    ref_key = ("ss_ca_oc", prev_idx, step_idx, block_idx)
     cache_path = _ss_ca_oc_cache_path(kwargs, prev_idx, step_idx, block_idx) if prev_idx is not None else None
 
-    if cache_path is not None and os.path.exists(cache_path):
-        ref = torch.load(cache_path, map_location=h_tar.device)
+    if cache_mode == "memory" and memory_cache is not None:
+        ref = memory_cache.get(ref_key)
+    if ref is not None or (cache_path is not None and os.path.exists(cache_path)):
+        if ref is None:
+            ref = torch.load(cache_path, map_location=h_tar.device)
         src_k = _ss_ca_oc_best_rotation(h_src, ref, grid_size, "src", kwargs, step_idx, block_idx)
         tar_k = _ss_ca_oc_best_rotation(h_tar, ref, grid_size, "tar", kwargs, step_idx, block_idx)
-        if kwargs.get("delete_loaded_ca_oc_cache", kwargs.get("delete_loaded_tfsa_cache", False)):
+        if cache_mode == "memory" and memory_cache is not None and kwargs.get("rm_cache", False):
+            memory_cache.pop(ref_key, None)
+        elif kwargs.get("delete_loaded_ca_oc_cache", kwargs.get("delete_loaded_tfsa_cache", False)) and not kwargs.get("rm_cache", False):
             try:
                 os.remove(cache_path)
             except FileNotFoundError:
@@ -131,13 +154,416 @@ def _ss_ca_oc_align_pair(
     h_src = _ss_rot90_tokens(h_src, src_k, grid_size)
     h_tar = _ss_rot90_tokens(h_tar, tar_k, grid_size)
     cur_path = _ss_ca_oc_cache_path(kwargs, morphing_idx, step_idx, block_idx)
-    if cur_path is not None and not os.path.exists(cur_path):
+    if cache_mode == "memory" and memory_cache is not None:
+        desc_dim = int(kwargs.get("ss_ca_oc_desc_dim", 32))
+        memory_cache[("ss_ca_oc", morphing_idx, step_idx, block_idx)] = {
+            "src": _ss_ca_oc_descriptor(h_src.detach(), desc_dim).cpu().half(),
+            "tar": _ss_ca_oc_descriptor(h_tar.detach(), desc_dim).cpu().half(),
+        }
+    elif cur_path is not None and not os.path.exists(cur_path):
+        os.makedirs(os.path.dirname(cur_path), exist_ok=True)
         desc_dim = int(kwargs.get("ss_ca_oc_desc_dim", 32))
         torch.save({
             "src": _ss_ca_oc_descriptor(h_src.detach(), desc_dim).cpu().half(),
             "tar": _ss_ca_oc_descriptor(h_tar.detach(), desc_dim).cpu().half(),
         }, cur_path)
     return h_src, h_tar
+
+
+def _ss_pre_fusion_dplc_coords(h: torch.Tensor, kwargs: dict) -> Optional[torch.Tensor]:
+    coords = kwargs.get("ss_coords", None)
+    if torch.is_tensor(coords):
+        return coords
+
+    endpoint_occ = kwargs.get("ss_endpoint_occ16", None)
+    if isinstance(endpoint_occ, dict) and torch.is_tensor(endpoint_occ.get("ss_token_coords", None)):
+        return endpoint_occ["ss_token_coords"]
+
+    if h.ndim != 3:
+        return None
+    token_count = h.shape[1]
+    grid_size = int(kwargs.get("ss_token_grid_size", kwargs.get("ss_ca_oc_grid_size", round(token_count ** (1.0 / 3.0)))))
+    if grid_size <= 0 or grid_size ** 3 != token_count:
+        return None
+    cache_key = (token_count, grid_size, str(h.device))
+    runtime_cache = kwargs.get("_runtime_cache", {})
+    coords_cache = runtime_cache.setdefault("ss_pre_fusion_dplc_coords", {}) if isinstance(runtime_cache, dict) else {}
+    if cache_key in coords_cache:
+        return coords_cache[cache_key]
+    axes = [torch.arange(grid_size, device=h.device) for _ in range(3)]
+    coords = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(token_count, 3)
+    coords_cache[cache_key] = coords
+    return coords
+
+
+def _ss_pre_fusion_dplc_knn_idx(coords: Optional[torch.Tensor], kwargs: dict, h: torch.Tensor) -> Optional[torch.Tensor]:
+    if coords is None or not torch.is_tensor(coords):
+        return None
+    k = int(kwargs.get("dplc_k", 8))
+    chunk_size = int(kwargs.get("dplc_chunk_size", 1024))
+    coords_key = (
+        tuple(coords.shape),
+        str(coords.device),
+        str(coords.dtype),
+        int(coords.data_ptr()) if coords.numel() else 0,
+        k,
+        chunk_size,
+    )
+    runtime_cache = kwargs.get("_runtime_cache", {})
+    knn_cache = runtime_cache.setdefault("ss_pre_fusion_dplc_knn", {}) if isinstance(runtime_cache, dict) else {}
+    if coords_key in knn_cache:
+        return knn_cache[coords_key]
+    from ...utils.pre_fusion_dplc import _chunked_knn, _xyz_coords
+    xyz = _xyz_coords(coords, h.shape[1], h.device)
+    if xyz is None or xyz.shape[0] <= 1:
+        return None
+    knn_idx = _chunked_knn(xyz, k=k, chunk_size=chunk_size)
+    knn_cache[coords_key] = knn_idx
+    return knn_idx
+
+
+def _append_pre_fusion_dplc_stats(stats: dict, kwargs: dict, step_idx: int, block_idx: int) -> None:
+    save_cache_path = kwargs.get("save_cache_path", None)
+    if save_cache_path is None:
+        return
+    try:
+        os.makedirs(save_cache_path, exist_ok=True)
+        record = dict(stats)
+        record.setdefault("stage", "ss_ca")
+        record.setdefault("morphing_idx", kwargs.get("morphing_idx", None))
+        record.setdefault("step_idx", step_idx)
+        record.setdefault("block_idx", block_idx)
+        with open(os.path.join(save_cache_path, "dplc_stats.txt"), "a", encoding="utf-8") as f:
+            f.write(f"{record}\n")
+    except Exception:
+        pass
+
+
+def _coords_to_ss_token_occ(coords_raw: torch.Tensor, ss_token_coords: torch.Tensor) -> torch.Tensor:
+    coords = torch.as_tensor(coords_raw).detach()
+    if coords.ndim != 2 or coords.shape[-1] not in (3, 4):
+        return torch.zeros(ss_token_coords.shape[0], dtype=torch.bool)
+    if coords.shape[-1] == 4:
+        coords = coords[:, 1:4]
+    coords = coords.long().cpu()
+    token_coords = ss_token_coords.detach().long().cpu()
+    grid_size = int(token_coords.max().item() + 1) if token_coords.numel() else 16
+    if coords.numel() and int(coords.max().item()) >= grid_size:
+        scale = max(1, int(round(64.0 / float(max(grid_size, 1)))))
+        coords = torch.div(coords, scale, rounding_mode="floor")
+    coords = coords.clamp(0, max(grid_size - 1, 0))
+    coord_to_index = {tuple(coord.tolist()): idx for idx, coord in enumerate(token_coords)}
+    occ = torch.zeros(token_coords.shape[0], dtype=torch.bool)
+    for coord in coords:
+        idx = coord_to_index.get(tuple(coord.tolist()))
+        if idx is not None:
+            occ[idx] = True
+    return occ
+
+
+def _six_neighbor_count(mask: torch.Tensor, coords_int: torch.Tensor) -> torch.Tensor:
+    coords_cpu = coords_int.detach().cpu().long()
+    mask_cpu = mask.detach().cpu().bool()
+    coord_to_index = {tuple(coord.tolist()): idx for idx, coord in enumerate(coords_cpu)}
+    counts = torch.zeros(coords_cpu.shape[0], device=mask.device, dtype=torch.float32)
+    for idx, coord in enumerate(coords_cpu.tolist()):
+        x, y, z = coord
+        count = 0
+        for nb in ((x + 1, y, z), (x - 1, y, z), (x, y + 1, z), (x, y - 1, z), (x, y, z + 1), (x, y, z - 1)):
+            nb_idx = coord_to_index.get(nb)
+            if nb_idx is not None and bool(mask_cpu[nb_idx].item()):
+                count += 1
+        counts[idx] = float(count)
+    return counts
+
+
+def _six_neighbor_index(coords_int: torch.Tensor) -> torch.Tensor:
+    coords_cpu = coords_int.detach().cpu().long()
+    coord_to_index = {tuple(coord): idx for idx, coord in enumerate(coords_cpu.tolist())}
+    neighbors = torch.full((coords_cpu.shape[0], 6), -1, dtype=torch.long)
+    for idx, coord in enumerate(coords_cpu.tolist()):
+        x, y, z = coord
+        for nb_i, nb in enumerate(((x + 1, y, z), (x - 1, y, z), (x, y + 1, z), (x, y - 1, z), (x, y, z + 1), (x, y, z - 1))):
+            nb_idx = coord_to_index.get(nb)
+            if nb_idx is not None:
+                neighbors[idx, nb_i] = nb_idx
+    return neighbors.to(device=coords_int.device)
+
+
+def _six_neighbor_count_from_index(mask: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
+    valid = neighbor_idx >= 0
+    safe_idx = neighbor_idx.clamp_min(0)
+    nb_mask = mask.bool()[safe_idx] & valid
+    return nb_mask.sum(dim=1).to(dtype=torch.float32)
+
+
+def _smooth_token_values_with_neighbors(
+    values: torch.Tensor,
+    neighbor_idx: torch.Tensor,
+    iterations: int,
+    weight: float,
+) -> torch.Tensor:
+    iterations = max(int(iterations), 0)
+    weight = min(max(float(weight), 0.0), 1.0)
+    if iterations == 0 or weight == 0.0:
+        return values
+    valid = neighbor_idx >= 0
+    safe_idx = neighbor_idx.clamp_min(0)
+    out = values
+    for _ in range(iterations):
+        nb_vals = out[safe_idx] * valid.to(dtype=out.dtype)
+        counts = valid.sum(dim=1).clamp_min(1).to(dtype=out.dtype)
+        nb_mean = nb_vals.sum(dim=1) / counts
+        has_neighbors = valid.any(dim=1)
+        blended = (1.0 - weight) * out + weight * nb_mean
+        out = torch.where(has_neighbors, blended, out)
+    return out
+
+
+def _load_dplc_history_occ(kwargs: dict, ss_token_coords: torch.Tensor, device: torch.device) -> Optional[torch.Tensor]:
+    save_cache_path = kwargs.get("save_cache_path", None)
+    morphing_idx = kwargs.get("morphing_idx", None)
+    if morphing_idx is None:
+        return None
+    morphing_idx = int(morphing_idx)
+    if morphing_idx <= 1:
+        return None
+    window = max(int(kwargs.get("dplc_evo_history_window", 3)), 1)
+    masks = []
+    for idx in range(max(1, morphing_idx - window), morphing_idx):
+        try:
+            coords_raw = kwargs.get("_coords_memory_cache", {}).get(idx)
+            if coords_raw is None:
+                if kwargs.get("save_coords_cache", False) and save_cache_path is not None:
+                    coords_path = os.path.join(save_cache_path, f"coords_morphing{idx}.pt")
+                    if os.path.exists(coords_path):
+                        coords_raw = torch.load(coords_path, map_location="cpu")
+            if coords_raw is None:
+                continue
+            masks.append(_coords_to_ss_token_occ(coords_raw, ss_token_coords).to(device=device))
+        except Exception:
+            continue
+    if not masks:
+        return None
+    return torch.stack(masks, dim=0).float()
+
+
+def _get_dplc_evolution_shift(
+    kwargs: dict,
+    endpoint_occ: dict,
+    token_count: int,
+    device: torch.device,
+) -> Optional[dict]:
+    alpha = float(kwargs.get("alpha", 0.5))
+    progress = min(max(1.0 - alpha, 0.0), 1.0)
+    morphing_idx = kwargs.get("morphing_idx", None)
+    cache_key = (
+        str(kwargs.get("save_cache_path", "")),
+        int(morphing_idx) if morphing_idx is not None else None,
+        token_count,
+        str(device),
+        round(progress, 6),
+        int(kwargs.get("dplc_evo_history_window", 3)),
+        round(float(kwargs.get("dplc_evo_start", 0.35)), 6),
+        round(float(kwargs.get("dplc_evo_strength", 0.18)), 6),
+        round(float(kwargs.get("dplc_evo_slow_strength", 0.08)), 6),
+        round(float(kwargs.get("dplc_evo_max_shift", 0.20)), 6),
+        int(kwargs.get("dplc_evo_min_neighbors", 1)),
+        int(kwargs.get("dplc_evo_smooth_iters", 0)),
+        round(float(kwargs.get("dplc_evo_smooth_weight", 0.0)), 6),
+        round(float(kwargs.get("dplc_evo_trend_bonus", 0.0)), 6),
+        round(float(kwargs.get("dplc_evo_support_floor", 0.65)), 6),
+        round(float(kwargs.get("dplc_evo_support_power", 1.0)), 6),
+        round(float(kwargs.get("dplc_evo_history_floor", 0.50)), 6),
+    )
+    runtime_cache = kwargs.get("_runtime_cache", {})
+    evo_cache = runtime_cache.setdefault("dplc_evo_shift", {}) if isinstance(runtime_cache, dict) else {}
+    if cache_key in evo_cache:
+        return evo_cache[cache_key]
+
+    ss_token_coords = torch.as_tensor(endpoint_occ["ss_token_coords"]).detach()
+    occ_s_16 = torch.as_tensor(endpoint_occ["occ_s_16"]).detach()
+    occ_t_16 = torch.as_tensor(endpoint_occ["occ_t_16"]).detach()
+    if ss_token_coords.shape != (token_count, 3) or occ_s_16.shape[0] != token_count or occ_t_16.shape[0] != token_count:
+        return None
+
+    history = _load_dplc_history_occ(kwargs, ss_token_coords, device)
+    if history is None:
+        return None
+
+    start = min(max(float(kwargs.get("dplc_evo_start", 0.35)), 0.0), 1.0)
+    strength = max(float(kwargs.get("dplc_evo_strength", 0.18)), 0.0)
+    slow_strength = max(float(kwargs.get("dplc_evo_slow_strength", 0.08)), 0.0)
+    min_neighbors = max(int(kwargs.get("dplc_evo_min_neighbors", 1)), 0)
+    max_shift = max(float(kwargs.get("dplc_evo_max_shift", 0.20)), 0.0)
+    smooth_iters = max(int(kwargs.get("dplc_evo_smooth_iters", 0)), 0)
+    smooth_weight = min(max(float(kwargs.get("dplc_evo_smooth_weight", 0.0)), 0.0), 1.0)
+    trend_bonus_strength = max(float(kwargs.get("dplc_evo_trend_bonus", 0.0)), 0.0)
+    support_floor = min(max(float(kwargs.get("dplc_evo_support_floor", 0.65)), 0.0), 1.0)
+    support_power = max(float(kwargs.get("dplc_evo_support_power", 1.0)), 0.0)
+    history_floor = min(max(float(kwargs.get("dplc_evo_history_floor", 0.50)), 0.0), 1.0)
+
+    coords_int = ss_token_coords.to(device=device).round().long()
+    neighbor_idx = _six_neighbor_index(coords_int)
+    occ_s = (occ_s_16 > 0).to(device=device)
+    occ_t = (occ_t_16 > 0).to(device=device)
+    birth = occ_t & (~occ_s)
+    death = occ_s & (~occ_t)
+    prev_occ = history[-1] > 0.5
+    ever_occ = history.max(dim=0).values > 0.5
+    hist_rate = history.mean(dim=0)
+    if history.shape[0] > 1:
+        hist_trend = history[-1] - history[0]
+    else:
+        hist_trend = torch.zeros_like(hist_rate)
+
+    target_nb = _six_neighbor_count_from_index(occ_t, neighbor_idx)
+    source_nb = _six_neighbor_count_from_index(occ_s, neighbor_idx)
+    supported_birth = target_nb >= float(min_neighbors)
+    supported_death = source_nb >= float(min_neighbors)
+    denom = max(6.0 - float(min_neighbors), 1.0)
+    birth_support_weight = ((target_nb - float(min_neighbors)) / denom).clamp(0.0, 1.0)
+    death_support_weight = ((source_nb - float(min_neighbors)) / denom).clamp(0.0, 1.0)
+    birth_support_weight = support_floor + (1.0 - support_floor) * birth_support_weight
+    death_support_weight = support_floor + (1.0 - support_floor) * death_support_weight
+    if support_power != 1.0:
+        birth_support_weight = birth_support_weight.pow(support_power)
+        death_support_weight = death_support_weight.pow(support_power)
+
+    late_scale = 0.0 if progress <= start else (progress - start) / max(1.0 - start, 1e-6)
+    early_scale = 0.0 if progress >= start else (start - progress) / max(start, 1e-6)
+
+    birth_late = birth & (~prev_occ) & supported_birth
+    death_late = death & prev_occ & supported_death
+    birth_early = birth & prev_occ & (hist_rate > 0.5)
+    death_early = death & (~ever_occ)
+
+    shift = torch.zeros(token_count, device=device, dtype=torch.float32)
+    trend_bonus = (1.0 + hist_trend.abs().clamp(0.0, 1.0) * trend_bonus_strength)
+    birth_hist_weight = (1.0 - hist_rate).clamp(history_floor, 1.0)
+    death_hist_weight = hist_rate.clamp(history_floor, 1.0)
+    shift[birth_late] += strength * late_scale * trend_bonus[birth_late] * birth_support_weight[birth_late] * birth_hist_weight[birth_late]
+    shift[death_late] += strength * late_scale * trend_bonus[death_late] * death_support_weight[death_late] * death_hist_weight[death_late]
+    shift[birth_early] -= slow_strength * early_scale * trend_bonus[birth_early] * birth_support_weight[birth_early] * hist_rate[birth_early].clamp(history_floor, 1.0)
+    shift[death_early] -= slow_strength * early_scale * trend_bonus[death_early] * death_support_weight[death_early] * (1.0 - hist_rate[death_early]).clamp(history_floor, 1.0)
+    shift = _smooth_token_values_with_neighbors(shift, neighbor_idx, smooth_iters, smooth_weight)
+    shift = shift.clamp(-max_shift, max_shift)
+    if not torch.any(shift != 0):
+        return None
+
+    result = {
+        "shift": shift,
+        "progress": progress,
+        "history_len": int(history.shape[0]),
+        "birth_late": int(birth_late.sum().item()),
+        "death_late": int(death_late.sum().item()),
+        "birth_early": int(birth_early.sum().item()),
+        "death_early": int(death_early.sum().item()),
+        "mean_shift": float(shift.abs().mean().detach().cpu().item()),
+        "max_shift": float(shift.abs().max().detach().cpu().item()),
+        "smooth_iters": smooth_iters,
+        "smooth_weight": smooth_weight,
+        "trend_bonus": trend_bonus_strength,
+        "support_floor": support_floor,
+        "support_power": support_power,
+        "history_floor": history_floor,
+        "mean_birth_support": float(birth_support_weight[birth_late | birth_early].mean().detach().cpu().item()) if torch.any(birth_late | birth_early) else 0.0,
+        "mean_death_support": float(death_support_weight[death_late | death_early].mean().detach().cpu().item()) if torch.any(death_late | death_early) else 0.0,
+    }
+    evo_cache[cache_key] = result
+    return result
+
+
+def _apply_dplc_evolution_fusion(
+    h_src: torch.Tensor,
+    h_tar: torch.Tensor,
+    kwargs: dict,
+    step_idx: int,
+    block_idx: int,
+) -> Optional[torch.Tensor]:
+    if not kwargs.get("enable_dplc_evolution", False):
+        return None
+
+    endpoint_occ = _load_ss_endpoint_occ16(kwargs, "PF-DPLC Evolution")
+    if endpoint_occ is None:
+        return None
+
+    try:
+        if h_src.ndim != 3 or h_src.shape != h_tar.shape:
+            return None
+        token_count = h_src.shape[1]
+        evo = _get_dplc_evolution_shift(kwargs, endpoint_occ, token_count, h_src.device)
+        if evo is None:
+            return None
+
+        shift = evo["shift"]
+        progress = float(evo["progress"])
+        progress_t = torch.as_tensor(progress, device=h_src.device, dtype=torch.float32)
+        local_progress = (progress_t + shift).clamp(0.0, 1.0).to(dtype=h_src.dtype).reshape(1, token_count, 1)
+        h = (1.0 - local_progress) * h_src + local_progress * h_tar
+
+        debug_this_call = (
+            kwargs.get("dplc_evo_debug", False)
+            and (
+                kwargs.get("dplc_evo_debug_every_call", False)
+                or block_idx == int(kwargs.get("dplc_evo_debug_block", 0))
+            )
+        )
+        if debug_this_call:
+            stats = {
+                "stage": "ss_ca_evolution",
+                "morphing_idx": kwargs.get("morphing_idx", None),
+                "step_idx": step_idx,
+                "block_idx": block_idx,
+                **{k: v for k, v in evo.items() if k != "shift"},
+            }
+            _append_pre_fusion_dplc_stats(stats, kwargs, step_idx, block_idx)
+            if kwargs.get("dplc_print_stats", False):
+                print(f"[PF-DPLC Evolution] step={step_idx} block={block_idx} stats={stats}")
+        return h
+    except Exception as exc:
+        if kwargs.get("dplc_print_stats", False):
+            print(f"[PF-DPLC Evolution] warning: failed: {exc}")
+        return None
+
+
+def _apply_pre_fusion_dplc_pair(
+    h_src: torch.Tensor,
+    h_tar: torch.Tensor,
+    kwargs: dict,
+    step_idx: int,
+    block_idx: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not kwargs.get("enable_pre_fusion_dplc", False):
+        return h_src, h_tar
+
+    debug = bool(kwargs.get("dplc_debug", False))
+    alpha = kwargs.get("alpha", 0.5)
+    dplc_alpha = (1.0 - alpha) if torch.is_tensor(alpha) else (1.0 - float(alpha))
+    coords = _ss_pre_fusion_dplc_coords(h_src, kwargs)
+    knn_idx = _ss_pre_fusion_dplc_knn_idx(coords, kwargs, h_src)
+    result = pre_fusion_dplc(
+        h_src=h_src,
+        h_tar=h_tar,
+        coords=coords,
+        alpha=dplc_alpha,
+        enabled=True,
+        k=kwargs.get("dplc_k", 8),
+        lam=kwargs.get("dplc_lam", 0.15),
+        collapse_th=kwargs.get("dplc_collapse_th", 0.75),
+        residual_quantile=kwargs.get("dplc_residual_quantile", 0.80),
+        max_delta_ratio=kwargs.get("dplc_max_delta_ratio", 0.15),
+        chunk_size=kwargs.get("dplc_chunk_size", 1024),
+        return_stats=debug,
+        knn_idx=knn_idx,
+    )
+    if debug:
+        h_src_new, h_tar_new, stats = result
+        _append_pre_fusion_dplc_stats(stats, kwargs, step_idx, block_idx)
+        if kwargs.get("dplc_print_stats", False):
+            print(f"[PF-DPLC] step={step_idx} block={block_idx} stats={stats}")
+        return h_src_new, h_tar_new
+    return result
 
 
 def _dump_ddpf_v0_debug(debug: dict, kwargs: dict, step_idx: int, block_idx: int) -> None:
@@ -863,25 +1289,27 @@ class ModulatedTransformerCrossBlock(nn.Module):
                 h = self.cross_attn(x=h, context=fused_context, step_idx=step_idx, block_idx=block_idx, **kwargs)
             elif kwargs["ss_mca_flag"]:
                 attn_kwargs = {
-                    "modify": kwargs.get("modify", False),
+                    "modify": _use_modify_this_step(kwargs, step_idx),
                     "gate_attn": kwargs.get("gate_attn", False),
+                    "gate_mode": kwargs.get("gate_mode", "logits"),
                     "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
                     "modify_max_passes": kwargs.get("modify_max_passes", 4),
                     "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
                     "modify_temperature": kwargs.get("modify_temperature", 1.0),
+                    "modify_impl": kwargs.get("modify_impl", "legacy"),
+                    "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
+                    "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
+                    "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
                 }
                 h_src = self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx, **attn_kwargs)
                 h_tar = self.cross_attn(x=h, context=kwargs["tar_cond"], step_idx=step_idx, block_idx=block_idx, **attn_kwargs)
                 h_src, h_tar = _ss_ca_oc_align_pair(h_src, h_tar, kwargs, step_idx, block_idx)
-                # print(score_src.shape) #[1, 4096]
-                # src_score = score_src          # [B, Lq]
-                # tar_score = score_tar          # [B, Lq]
-                # score_diff = tar_score - src_score   # [B, Lq]
-                # lambda_ = 5.0
-                # delta_alpha = 0.3 * torch.tanh(lambda_ * score_diff)   # [B, Lq]
-                # delta_alpha = delta_alpha.unsqueeze(-1)  # [B, Lq, 1]
-                # alpha = torch.clamp(kwargs["alpha"] - delta_alpha, 0.0, 1.0)
-                h = feature_interp(h_src, h_tar, kwargs["alpha"], interp_mode="linear")
+                h_src, h_tar = _apply_pre_fusion_dplc_pair(h_src, h_tar, kwargs, step_idx, block_idx)
+                h_evo = _apply_dplc_evolution_fusion(h_src, h_tar, kwargs, step_idx, block_idx)
+                if h_evo is None:
+                    h = feature_interp(h_src, h_tar, kwargs["alpha"], interp_mode="linear")
+                else:
+                    h = h_evo
                 if kwargs.get("mavf_enable", False):
                     h = _apply_mavf_v0_birth_field(h, h_src, h_tar, kwargs, step_idx, block_idx)
                 elif kwargs.get("enable_cmf_v0", False):

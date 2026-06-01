@@ -153,7 +153,13 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
 
         if len(kwargs) > 0:
             if kwargs["slat_tfsa_flag"]:
-                h = slat_interp(self.self_attn(x=h, step_idx=step_idx, block_idx=block_idx, **kwargs), self.self_attn(x=h, step_idx=step_idx, block_idx=block_idx, cache_idx=-1, **kwargs), alpha=kwargs["tfsa_alpha"])
+                slat_fuse_kwargs = {k: v for k, v in kwargs.items() if k != "alpha"}
+                h = slat_fuse(
+                    self.self_attn(x=h, step_idx=step_idx, block_idx=block_idx, **kwargs),
+                    self.self_attn(x=h, step_idx=step_idx, block_idx=block_idx, cache_idx=-1, **kwargs),
+                    alpha=kwargs["tfsa_alpha"],
+                    **slat_fuse_kwargs,
+                )
             else:
                 h = self.self_attn(x=h, step_idx=step_idx, block_idx=block_idx, **kwargs)
         else:
@@ -169,10 +175,11 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
                 fused_context = feature_interp(context, kwargs["tar_cond"], alpha, interp_mode="linear")
                 h = self.cross_attn(x=h, context=fused_context, step_idx=step_idx, block_idx=block_idx, **kwargs)
             elif kwargs["slat_mca_flag"]:
-                h = slat_interp(
+                h = slat_fuse(
                     self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx, **kwargs),
                     self.cross_attn(x=h, context=kwargs["tar_cond"], step_idx=step_idx, block_idx=block_idx, **kwargs),
                     alpha=kwargs["alpha"],
+                    **{k: v for k, v in kwargs.items() if k != "alpha"},
                 )
             else:
                 h = self.cross_attn(x=h, context=context, step_idx=step_idx, block_idx=block_idx, **kwargs)

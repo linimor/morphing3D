@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 assets/
 TRELLIS-image-large/
+environment.yml
 README.md
 setup.py
 IMPUS/

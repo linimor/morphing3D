@@ -9,8 +9,17 @@ def modify_attn_score(
     max_passes: int = 12,
     stop_conflict: float = 0.5,
     temperature: float = 1.0,
+    impl: str = "legacy",
 ) -> torch.Tensor:
     """Reduce many-query-to-one-key conflicts in raw attention logits."""
+    if impl == "fixed":
+        return modify_attn_score_fixed(
+            attn_score,
+            lambda_scale=lambda_scale,
+            max_passes=max_passes,
+            stop_conflict=stop_conflict,
+            temperature=temperature,
+        )
     score = attn_score.float().clone()
     dtype = attn_score.dtype
     bsz, heads, query_len, key_len = score.shape
@@ -38,6 +47,46 @@ def modify_attn_score(
         cur = flat[m_idx, q_idx, k_idx]
         penalty = float(lambda_scale) * (1.0 + crowd_for_query[m_idx, q_idx]) * winner_for_query[m_idx, q_idx]
         flat[m_idx, q_idx, k_idx] = torch.clamp(cur - penalty, min=0.0)
+
+    return flat.reshape(bsz, heads, query_len, key_len).to(dtype)
+
+
+def modify_attn_score_fixed(
+    attn_score: torch.Tensor,
+    lambda_scale: float = 3,
+    max_passes: int = 12,
+    stop_conflict: float = 0.5,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    CGAR conflict reduction with the legacy update rule, but without per-pass
+    CPU synchronization or nonzero-based writes.
+    """
+    max_passes = max(int(max_passes), 0)
+    if max_passes == 0:
+        return attn_score
+
+    dtype = attn_score.dtype
+    score = attn_score.float().clone()
+    bsz, heads, query_len, key_len = score.shape
+    flat = score.reshape(bsz * heads, query_len, key_len)
+
+    for _ in range(max_passes):
+        best_val, best_key = flat.max(dim=-1)
+        counts = torch.zeros(flat.shape[0], key_len, device=flat.device, dtype=flat.dtype)
+        counts.scatter_add_(1, best_key, torch.ones_like(best_val))
+        overload = torch.relu(counts - 1.0)
+        keep_correcting = overload.sum(dim=1).mean() > float(stop_conflict)
+
+        winner = torch.full_like(counts, -torch.inf)
+        winner.scatter_reduce_(1, best_key, best_val, reduce="amax", include_self=True)
+        winner_for_query = winner.gather(1, best_key)
+        crowd_for_query = overload.gather(1, best_key)
+        loser = keep_correcting & (counts.gather(1, best_key) > 1) & (best_val < winner_for_query) & (best_val > 0)
+
+        penalty = float(lambda_scale) * (1.0 + crowd_for_query) * winner_for_query
+        new_val = torch.where(loser, torch.clamp(best_val - penalty, min=0.0), best_val)
+        flat.scatter_(2, best_key.unsqueeze(-1), new_val.unsqueeze(-1))
 
     return flat.reshape(bsz, heads, query_len, key_len).to(dtype)
 

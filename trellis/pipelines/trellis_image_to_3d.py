@@ -20,18 +20,14 @@ try:
     from pytorch3d.loss import chamfer_distance
 except ImportError:
     chamfer_distance = None
-try:
-    from scipy import ndimage as _ndi
-except ImportError:
-    _ndi = None
 from glob import glob
 os.environ["U2NET_PATH"] = "/root/autodl-tmp/MorphAny3D/u2net.onnx"
 
 MORPHING_ATTENTION_DEFAULTS = {
     "modify": False,
-    "sparse_modify": None,
+    "sparse_modify": False,
     "gate_attn": False,
-    "sparse_gate_attn": None,
+    "sparse_gate_attn": False,
     "gate_mode": "logits",
     "modify_mode": "legacy",
     "modify_precheck": False,
@@ -41,6 +37,9 @@ MORPHING_ATTENTION_DEFAULTS = {
     "modify_lambda_scale": 0.3,
     "modify_max_passes": 4,
     "modify_stop_conflict": 0.5,
+    "modify_step_stride": 1,
+    "modify_start_step": 0,
+    "modify_end_step": None,
     "modify_temperature": 1.0,
     "modify_sink_threshold": 0.15,
     "modify_sink_top_count_weight": 0.5,
@@ -54,13 +53,32 @@ MORPHING_ATTENTION_DEFAULTS = {
     "ss_ca_oc_grid_size": 16,
     "ss_ca_oc_desc_dim": 32,
     "delete_loaded_ca_oc_cache": False,
-    "topo_repair_enable": False,
-    "topo_repair_mu": 0.3,
-    "topo_repair_uncert_weight": 1.0,
-    "topo_repair_thin_weight": 0.5,
-    "topo_repair_air_weight": 1.0,
-    "topo_repair_target_weight": 1.0,
-    "topo_repair_fg_weight": 0.5,
+    "enable_pre_fusion_dplc": False,
+    "dplc_k": 8,
+    "dplc_lam": 0.15,
+    "dplc_collapse_th": 0.75,
+    "dplc_residual_quantile": 0.80,
+    "dplc_max_delta_ratio": 0.15,
+    "dplc_chunk_size": 1024,
+    "dplc_debug": False,
+    "dplc_print_stats": False,
+    "enable_dplc_evolution": False,
+    "dplc_evo_history_window": 3,
+    "dplc_evo_start": 0.35,
+    "dplc_evo_strength": 0.18,
+    "dplc_evo_slow_strength": 0.08,
+    "dplc_evo_max_shift": 0.20,
+    "dplc_evo_min_neighbors": 1,
+    "dplc_evo_smooth_iters": 0,
+    "dplc_evo_smooth_weight": 0.0,
+    "dplc_evo_trend_bonus": 0.0,
+    "dplc_evo_support_floor": 0.65,
+    "dplc_evo_support_power": 1.0,
+    "dplc_evo_history_floor": 0.50,
+    "dplc_evo_debug": False,
+    "dplc_evo_debug_every_call": False,
+    "dplc_evo_debug_block": 0,
+    "slat_fuse_mode": "linear",
 }
 
 
@@ -105,51 +123,6 @@ def _with_morphing_attention_defaults(morphing_params: dict) -> dict:
     for key, value in MORPHING_ATTENTION_DEFAULTS.items():
         morphing_params.setdefault(key, value)
     return morphing_params
-
-
-def _topo_repair_structure():
-    if _ndi is None:
-        return None
-    return _ndi.generate_binary_structure(3, 1)
-
-
-def _topo_repair_reachable_air(local_occ: np.ndarray) -> np.ndarray:
-    bg = ~local_occ.astype(bool)
-    if _ndi is None or not bg.any():
-        return np.zeros_like(bg, dtype=bool)
-
-    labels, _ = _ndi.label(bg, structure=_topo_repair_structure())
-    boundary = np.zeros_like(bg, dtype=bool)
-    boundary[0, :, :] = True
-    boundary[-1, :, :] = True
-    boundary[:, 0, :] = True
-    boundary[:, -1, :] = True
-    boundary[:, :, 0] = True
-    boundary[:, :, -1] = True
-    boundary_labels = np.unique(labels[boundary & bg])
-    boundary_labels = boundary_labels[boundary_labels != 0]
-    if boundary_labels.size == 0:
-        return np.zeros_like(bg, dtype=bool)
-    return np.isin(labels, boundary_labels)
-
-
-def _topo_repair_air_opening_gain(occ: np.ndarray, cluster: np.ndarray, pad: int = 3) -> float:
-    if _ndi is None or not cluster.any():
-        return 0.0
-
-    pts = np.argwhere(cluster)
-    lo = np.maximum(pts.min(axis=0) - pad, 0)
-    hi = np.minimum(pts.max(axis=0) + pad + 1, np.array(occ.shape))
-    slc = tuple(slice(int(lo[i]), int(hi[i])) for i in range(3))
-    local_occ = occ[slc].astype(bool).copy()
-    local_cluster = cluster[slc].astype(bool)
-
-    reachable_before = _topo_repair_reachable_air(local_occ)
-    local_occ_after = local_occ & ~local_cluster
-    reachable_after = _topo_repair_reachable_air(local_occ_after)
-    opened = reachable_after & ~reachable_before
-    gain = float(opened.sum()) / float(max(int(local_cluster.sum()), 1))
-    return float(np.clip(np.log1p(gain) / np.log1p(16.0), 0.0, 1.0))
 
 
 def _morphing_cache_name(cache_path: str) -> str:
@@ -369,6 +342,7 @@ class TrellisImageTo3DPipeline(Pipeline):
             'cond': cond,
             'neg_cond': neg_cond,
         }
+
     def sample_sparse_structure(
         self,
         cond: dict,
@@ -402,128 +376,6 @@ class TrellisImageTo3DPipeline(Pipeline):
 
         return coords
 
-    def _topo_repair_target_support(
-        self,
-        morphing_params: dict,
-        spatial_shape: Tuple[int, int, int],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        support = torch.zeros(spatial_shape, device=device, dtype=dtype)
-        target_cache = morphing_params.get("tar_load_cache_path", None)
-        if target_cache is None:
-            return support
-
-        zs_path = os.path.join(target_cache, "coords_zs.pt")
-        coords_path = os.path.join(target_cache, "coords.pt")
-        try:
-            if os.path.exists(zs_path):
-                z_t = torch.load(zs_path, map_location=device).to(device)
-                target_logits = self.models['sparse_structure_decoder'](z_t)
-                while target_logits.ndim > 3:
-                    target_logits = target_logits[0]
-                target_prob = torch.sigmoid(target_logits.to(dtype=dtype))
-                target_occ = (target_logits > 0).to(dtype=dtype)
-                density = F.avg_pool3d(target_occ[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
-                return (0.5 * target_prob + 0.5 * density).clamp_(0.0, 1.0)
-
-            if os.path.exists(coords_path):
-                coords = torch.load(coords_path, map_location="cpu")
-                if coords.ndim != 2 or coords.shape[-1] not in (3, 4):
-                    return support
-                coords = coords[:, 1:] if coords.shape[-1] == 4 else coords
-                coords = coords.long()
-                shape = torch.tensor(spatial_shape, dtype=torch.long)
-                if coords.numel() > 0:
-                    coords = coords.clamp_min(0)
-                    coords = torch.minimum(coords, shape[None] - 1)
-                    occ = torch.zeros(spatial_shape, device=device, dtype=dtype)
-                    occ[coords[:, 0].to(device), coords[:, 1].to(device), coords[:, 2].to(device)] = 1.0
-                    density = F.avg_pool3d(occ[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
-                    return (0.5 * occ + 0.5 * density).clamp_(0.0, 1.0)
-        except Exception as exc:
-            print(f"[Topo repair] warning: failed to build target support: {exc}")
-        return support
-
-    def _soft_topology_aware_voxel_repair(
-        self,
-        voxel_logits: torch.Tensor,
-        morphing_params: dict,
-    ) -> torch.Tensor:
-        if _ndi is None:
-            print("[Topo repair] warning: scipy is unavailable; skip topology-aware repair")
-            return voxel_logits
-
-        original_shape = voxel_logits.shape
-        if voxel_logits.ndim == 5:
-            logits_bc = voxel_logits
-        elif voxel_logits.ndim == 4:
-            logits_bc = voxel_logits[:, None]
-        else:
-            raise ValueError(f"expected voxel logits [B, C, D, H, W] or [B, D, H, W], got {tuple(original_shape)}")
-
-        repaired = logits_bc.clone()
-
-        mu = float(morphing_params.get("topo_repair_mu", 0.3))
-        uncert_weight = max(float(morphing_params.get("topo_repair_uncert_weight", 1.0)), 1e-6)
-        thin_weight = float(morphing_params.get("topo_repair_thin_weight", 0.5))
-        air_weight = float(morphing_params.get("topo_repair_air_weight", 1.0))
-        target_weight = float(morphing_params.get("topo_repair_target_weight", 1.0))
-        fg_weight = float(morphing_params.get("topo_repair_fg_weight", 0.5))
-
-        for b in range(logits_bc.shape[0]):
-            for c in range(logits_bc.shape[1]):
-                logits_item = logits_bc[b, c]
-                occ_before_t = logits_item > 0
-                occ = occ_before_t.detach().cpu().numpy().astype(bool)
-                logits_np = logits_item.detach().float().cpu().numpy()
-
-                if not occ.any():
-                    continue
-
-                target_support = self._topo_repair_target_support(
-                    morphing_params,
-                    tuple(logits_item.shape),
-                    logits_item.device,
-                    logits_item.dtype,
-                )
-                target_support_np = target_support.detach().float().cpu().numpy()
-
-                thickness = _ndi.distance_transform_edt(occ).astype(np.float32)
-                thinness = np.zeros_like(thickness, dtype=np.float32)
-                thinness[occ] = 1.0 / (thickness[occ] + 1e-6)
-                uncertainty = np.exp(-np.abs(logits_np) * uncert_weight).astype(np.float32)
-                fg_density = _ndi.uniform_filter(occ.astype(np.float32), size=3, mode="constant", cval=0.0)
-
-                candidate = occ & (uncertainty >= np.exp(-1.0)) & (thickness <= 3.0)
-
-                air_gain = np.zeros_like(logits_np, dtype=np.float32)
-                if candidate.any():
-                    labels, comp_count = _ndi.label(candidate, structure=_topo_repair_structure())
-                    for comp_idx in range(1, int(comp_count) + 1):
-                        cluster = labels == comp_idx
-                        gain = _topo_repair_air_opening_gain(occ, cluster)
-                        if gain > 0:
-                            air_gain[cluster] = gain
-
-                target_protect = np.clip(target_support_np * target_weight, 0.0, 1.0)
-                fg_protect = np.clip(fg_density * fg_weight, 0.0, 1.0)
-                score = (
-                    candidate.astype(np.float32)
-                    * uncertainty
-                    * np.power(np.clip(thinness, 0.0, 1.0), max(thin_weight, 0.0))
-                    * np.power(np.clip(air_gain, 0.0, 1.0), max(air_weight, 0.0))
-                    * (1.0 - target_protect)
-                    * (1.0 - fg_protect)
-                ).astype(np.float32)
-
-                score_t = torch.from_numpy(score).to(device=logits_item.device, dtype=logits_item.dtype)
-                repaired[b, c] = logits_item - mu * score_t
-
-        if voxel_logits.ndim == 4:
-            repaired = repaired[:, 0]
-        return repaired.reshape(original_shape)
-
     def sample_sparse_structure_morphing(
         self,
         cond: dict,
@@ -550,7 +402,10 @@ class TrellisImageTo3DPipeline(Pipeline):
             src_noise = torch.load(os.path.join(morphing_params["src_load_cache_path"], "coords_zs_init.pt")).to(self.device)
             tar_noise = torch.load(os.path.join(morphing_params["tar_load_cache_path"], "coords_zs_init.pt")).to(self.device)
             noise = feature_interp(src_noise, tar_noise, morphing_params["alpha"])
-        sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
+        explicit_sampler_params = dict(sampler_params)
+        sampler_params = {**self.sparse_structure_sampler_params, **explicit_sampler_params}
+        if "ss_steps" in morphing_params and "steps" not in explicit_sampler_params:
+            sampler_params["steps"] = int(morphing_params["ss_steps"])
         sampler_kwargs = dict(morphing_params)
         sampler_kwargs["ss_num_steps"] = sampler_params.get("steps", sampler_kwargs.get("ss_num_steps", None))
         sampler_kwargs["ss_token_grid_size"] = getattr(flow_model, "resolution", reso) // getattr(flow_model, "patch_size", 1)
@@ -599,14 +454,21 @@ class TrellisImageTo3DPipeline(Pipeline):
         # Decode occupancy latent
         decoder = self.models['sparse_structure_decoder']
         voxel_logits = decoder(z_s)
-        if morphing_params.get("topo_repair_enable", False):
-            voxel_logits = self._soft_topology_aware_voxel_repair(voxel_logits, morphing_params)
         voxels = voxel_logits > 0
         coords = torch.argwhere(voxels)[:, [0, 2, 3, 4]].int()
-        if "save_cache_path" in morphing_params and "morphing_idx" in morphing_params:
-            coords_path = f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['morphing_idx']}.pt"
-            if not os.path.exists(coords_path):
-                torch.save(coords.detach().cpu(), coords_path)
+        if "morphing_idx" in morphing_params:
+            coords_cache_mode = morphing_params.get(
+                "coords_cache_mode",
+                "memory" if morphing_params.get("tfsa_cache_mode", "disk") == "memory" else "none",
+            )
+            if coords_cache_mode == "memory":
+                morphing_params.setdefault("_coords_memory_cache", {})[
+                    int(morphing_params["morphing_idx"])
+                ] = coords.detach().cpu()
+            elif morphing_params.get("save_coords_cache", False) and "save_cache_path" in morphing_params:
+                coords_path = f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['morphing_idx']}.pt"
+                if not os.path.exists(coords_path):
+                    torch.save(coords.detach().cpu(), coords_path)
 
         if "save_cache_path" in morphing_params and "morphing_idx" not in morphing_params:
             torch.save(noise.detach().cpu(), f"{morphing_params['save_cache_path']}/coords_zs_init.pt")
@@ -620,7 +482,12 @@ class TrellisImageTo3DPipeline(Pipeline):
         return voxels, coords
 
     def _ensure_ss_endpoint_occ16_for_mavf(self, morphing_params: dict) -> None:
-        if not morphing_params.get("mavf_enable", False):
+        if not (
+            morphing_params.get("mavf_enable", False)
+            or morphing_params.get("enable_cmf_v0", False)
+            or morphing_params.get("enable_ddpf_v0", False)
+            or morphing_params.get("enable_dplc_evolution", False)
+        ):
             return
         src_cache = morphing_params.get("src_load_cache_path", None)
         tar_cache = morphing_params.get("tar_load_cache_path", None)
@@ -654,7 +521,7 @@ class TrellisImageTo3DPipeline(Pipeline):
                 endpoint_path,
             )
         except Exception as exc:
-            print(f"[MAVF V0] warning: failed to build endpoint occupancy cache {endpoint_path}: {exc}")
+            print(f"[SS endpoint occ16] warning: failed to build endpoint occupancy cache {endpoint_path}: {exc}")
         
 
     def decode_slat(
@@ -701,7 +568,10 @@ class TrellisImageTo3DPipeline(Pipeline):
             feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
             coords=coords,
         )
-        sampler_params = {**self.slat_sampler_params, **sampler_params}
+        explicit_sampler_params = dict(sampler_params)
+        sampler_params = {**self.slat_sampler_params, **explicit_sampler_params}
+        if "slat_steps" in morphing_params and "steps" not in explicit_sampler_params:
+            sampler_params["steps"] = int(morphing_params["slat_steps"])
         slat = self.slat_sampler.sample(
             flow_model,
             noise,
@@ -831,12 +701,38 @@ class TrellisImageTo3DPipeline(Pipeline):
         """
         torch.manual_seed(seed)
         morphing_params = _with_morphing_attention_defaults(morphing_params)
+        morphing_params.setdefault("_runtime_cache", {})
+        if morphing_params.get("coords_cache_mode", "memory") == "memory":
+            morphing_params.setdefault("_coords_memory_cache", {})
 
-        src_img = self.preprocess_image(src_img)
-        src_cond = self.get_cond([src_img])
-        
-        tar_img = self.preprocess_image(tar_img)
-        tar_cond = self.get_cond([tar_img])
+        cache_image_cond = morphing_params.get("cache_image_cond", True)
+        src_img_id = id(src_img)
+        tar_img_id = id(tar_img)
+        if (
+            cache_image_cond
+            and morphing_params.get("_src_cond_img_id", None) == src_img_id
+            and "_src_cond_cache" in morphing_params
+        ):
+            src_cond = morphing_params["_src_cond_cache"]
+        else:
+            src_img = self.preprocess_image(src_img)
+            src_cond = self.get_cond([src_img])
+            if cache_image_cond:
+                morphing_params["_src_cond_img_id"] = src_img_id
+                morphing_params["_src_cond_cache"] = src_cond
+
+        if (
+            cache_image_cond
+            and morphing_params.get("_tar_cond_img_id", None) == tar_img_id
+            and "_tar_cond_cache" in morphing_params
+        ):
+            tar_cond = morphing_params["_tar_cond_cache"]
+        else:
+            tar_img = self.preprocess_image(tar_img)
+            tar_cond = self.get_cond([tar_img])
+            if cache_image_cond:
+                morphing_params["_tar_cond_img_id"] = tar_img_id
+                morphing_params["_tar_cond_cache"] = tar_cond
         morphing_params["tar_cond"] = tar_cond["cond"]
         self._ensure_ss_endpoint_occ16_for_mavf(morphing_params)
 
@@ -845,8 +741,14 @@ class TrellisImageTo3DPipeline(Pipeline):
         if morphing_params["oc_flag"]:  
             if chamfer_distance is None:
                 raise ImportError("pytorch3d is required when morphing_params['oc_flag'] is True")
-            if os.path.exists(f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['tfsa_cache_idx']}.pt"):
-                coords_cache = torch.load(f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['tfsa_cache_idx']}.pt").to(self.device)
+            coords_cache = None
+            if morphing_params.get("coords_cache_mode", "memory") == "memory":
+                coords_cache = morphing_params.get("_coords_memory_cache", {}).get(int(morphing_params["tfsa_cache_idx"]))
+            coords_cache_path = f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['tfsa_cache_idx']}.pt"
+            if coords_cache is None and morphing_params.get("save_coords_cache", False) and os.path.exists(coords_cache_path):
+                coords_cache = torch.load(coords_cache_path)
+            if coords_cache is not None:
+                coords_cache = coords_cache.to(self.device)
 
                 preprocess_coords = coords[:, 1:].detach() / 63 - 0.5
                 preprocess_coords_cache = coords_cache[:, 1:] / 63 - 0.5
@@ -872,17 +774,42 @@ class TrellisImageTo3DPipeline(Pipeline):
                         tmp_cache["v"] = torch.rot90(tmp_cache["v"].reshape((16,16,16,-1)), k=best_idx, dims=[0, 1]).reshape(cache_shape)
                         torch.save(tmp_cache, f)
 
-            if not os.path.exists(f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['morphing_idx']}.pt"):
-                torch.save(coords.detach().cpu(), f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['morphing_idx']}.pt")
+            if morphing_params.get("coords_cache_mode", "memory") == "memory":
+                morphing_params.setdefault("_coords_memory_cache", {})[
+                    int(morphing_params["morphing_idx"])
+                ] = coords.detach().cpu()
+            elif morphing_params.get("save_coords_cache", False):
+                coords_path = f"{morphing_params['save_cache_path']}/coords_morphing{morphing_params['morphing_idx']}.pt"
+                if not os.path.exists(coords_path):
+                    torch.save(coords.detach().cpu(), coords_path)
 
         if "dual_tar_img" in morphing_params:
-            dual_tar_img = self.preprocess_image(morphing_params["dual_tar_img"])
-            dual_tar_cond = self.get_cond([dual_tar_img])
+            dual_tar_img_id = id(morphing_params["dual_tar_img"])
+            if (
+                cache_image_cond
+                and morphing_params.get("_dual_tar_cond_img_id", None) == dual_tar_img_id
+                and "_dual_tar_cond_cache" in morphing_params
+            ):
+                dual_tar_cond = morphing_params["_dual_tar_cond_cache"]
+            else:
+                dual_tar_img = self.preprocess_image(morphing_params["dual_tar_img"])
+                dual_tar_cond = self.get_cond([dual_tar_img])
+                if cache_image_cond:
+                    morphing_params["_dual_tar_cond_img_id"] = dual_tar_img_id
+                    morphing_params["_dual_tar_cond_cache"] = dual_tar_cond
             morphing_params["tar_cond"] = dual_tar_cond["cond"]
             morphing_params["tar_load_cache_path"] = morphing_params["dual_tar_load_cache_path"]
 
         slat = self.sample_slat_morphing(src_cond, coords, slat_sampler_params, morphing_params)
         outputs = self.decode_slat(slat, formats)
+
+        if morphing_params.get("rm_cache", False):
+            cleanup_morphing_attention_cache(
+                morphing_params.get("save_cache_path"),
+                morphing_params.get("tfsa_cache_idx"),
+                delete_feat_coords=morphing_params.get("delete_feat_coords_cache", True),
+                delete_coords=morphing_params.get("delete_coords_cache", not morphing_params.get("oc_flag", False)),
+            )
 
         return outputs
     

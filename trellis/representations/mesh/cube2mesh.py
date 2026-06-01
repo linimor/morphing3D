@@ -34,7 +34,6 @@ class MeshExtractResult:
         v2 = verts[i2, :]
         face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
         face_normals = torch.nn.functional.normalize(face_normals, dim=1)
-        # print(face_normals.min(), face_normals.max(), face_normals.shape)
         return face_normals[:, None, :].repeat(1, 3, 1)
                 
     def comput_v_normals(self, verts, faces):

@@ -21,11 +21,9 @@ for tmp_name in [
     # close category: construction vehicles
     # ["typical_vehicle_bulldozer.png", "typical_vehicle_excavator.png"],
     # distant category: plant/object to electronics
-    # ["robot.png", "radio.png"],
+    ["robot.png", "radio.png"],
     # large spatial occupancy difference: thin vertical object to wide object
     # ["Staff.png", "typical_vehicle_biplane.png"],
-    # ['beg.png','cactus.png']
-    ['typical_humanoid_goblin.png','typical_creature_dragon.png']
     ]:
     src_img_path_list.append(f"./assets/example_morphing/{tmp_name[0]}")
     tar_img_path_list.append(f"./assets/example_morphing/{tmp_name[1]}")
@@ -67,7 +65,7 @@ for idx in range(len(src_img_path_list)):
         run_morphing_cache(pipeline, tar_img, src_img, morphing_params, SEED, tar_save_path, tar_name)
 
     experiment_methods = [
-        # ("base", []),
+        ("base", []),
         ("CGAR_CA_OC_DPLC_EVOLUTION", ["CGAR", "CA_OC", "DPLC_EVOLUTION"]),
     ]
     for method_name, methods in experiment_methods:
@@ -75,14 +73,14 @@ for idx in range(len(src_img_path_list)):
         morphing_params = build_morphing_params(
             methods,
             overrides={
-                "morphing_num": 15,
+                "morphing_num": 50,
                 "src_load_cache_path": src_save_cache_path,
                 "tar_load_cache_path": tar_save_cache_path,
             },
         )
-        save_path = os.path.join(save_dir_path, "3Dmorphing", name)
+        save_path = os.path.join(save_dir_path, "3Dmorphing_ply", name)
         os.makedirs(save_path, exist_ok=True)
         save_cache_path = os.path.join(save_path, "cache")
         os.makedirs(save_cache_path, exist_ok=True)
         morphing_params["save_cache_path"] = save_cache_path
-        run_morphing(pipeline, src_img, tar_img, morphing_params, SEED, save_path, name)
+        run_morphing_ply(pipeline, src_img, tar_img, morphing_params, SEED, save_path, name)

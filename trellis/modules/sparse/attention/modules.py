@@ -105,12 +105,8 @@ class SparseMultiHeadAttention(nn.Module):
         return qkv
     
     def forward(self, x: Union[SparseTensor, torch.Tensor], context: Optional[Union[SparseTensor, torch.Tensor]] = None, step_idx: int = 0, block_idx: int = 0, cache_idx: int = 0, **kwargs) -> Union[SparseTensor, torch.Tensor]:
-        sparse_modify = kwargs.get("sparse_modify", None)
-        if sparse_modify is None:
-            sparse_modify = kwargs.get("modify", False)
-        sparse_gate_attn = kwargs.get("sparse_gate_attn", None)
-        if sparse_gate_attn is None:
-            sparse_gate_attn = kwargs.get("gate_attn", False)
+        sparse_modify = kwargs.get("sparse_modify", False)
+        sparse_gate_attn = kwargs.get("sparse_gate_attn", False)
         full_attn_kwargs = {
             "modify": sparse_modify,
             "gate_attn": sparse_gate_attn,
@@ -140,22 +136,53 @@ class SparseMultiHeadAttention(nn.Module):
                 qkv = self._linear(self.to_qkv, x)
                 qkv = self._fused_pre(qkv, num_fused=3)
                 if kwargs["slat_tfsa_flag"]:
+                    cache_mode = kwargs.get("tfsa_cache_mode", "disk")
+                    memory_cache = kwargs.get("_tfsa_memory_cache", None)
                     if cache_idx == 0:
-                        if not os.path.exists(f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt"):
-                            torch.save({"k": qkv.feats[:, 1, :, :].detach().cpu(), "v": qkv.feats[:, 2, :, :].detach().cpu()}, f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt")
-                        if not os.path.exists(f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['morphing_idx']}.pt"):
+                        if kwargs.get("save_current_tfsa_cache", True):
+                            if cache_mode == "memory" and memory_cache is not None:
+                                memory_cache[("slat_sa", kwargs["morphing_idx"], step_idx, block_idx)] = {
+                                    "k": qkv.feats[:, 1, :, :].detach().cpu(),
+                                    "v": qkv.feats[:, 2, :, :].detach().cpu(),
+                                    "coords": x.coords.detach().cpu(),
+                                }
+                            elif not os.path.exists(f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt"):
+                                torch.save({
+                                    "k": qkv.feats[:, 1, :, :].detach().cpu(),
+                                    "v": qkv.feats[:, 2, :, :].detach().cpu(),
+                                    "coords": x.coords.detach().cpu(),
+                                }, f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt")
+                        if kwargs.get("save_feat_coords_cache", False) and not os.path.exists(f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['morphing_idx']}.pt"):
                             torch.save(x.coords.detach().cpu(), f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['morphing_idx']}.pt")
                     elif cache_idx == -1:
+                        cache = None
+                        cache_key = ("slat_sa", kwargs["tfsa_cache_idx"], step_idx, block_idx)
+                        if cache_mode == "memory" and memory_cache is not None:
+                            cache = memory_cache.get(cache_key)
                         cache_path = f"{kwargs['save_cache_path']}/slat_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt"
-                        if os.path.exists(cache_path):
+                        if cache is not None or os.path.exists(cache_path):
                             split_flag = True
-                            cache = torch.load(cache_path)
-                            cache_coords = torch.load(f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['tfsa_cache_idx']}.pt")
+                            if cache is None:
+                                cache = torch.load(cache_path)
+                            coords_path = f"{kwargs['save_cache_path']}/feat_coords_morphing{kwargs['tfsa_cache_idx']}.pt"
+                            if "coords" in cache:
+                                cache_coords = cache["coords"]
+                            elif os.path.exists(coords_path):
+                                cache_coords = torch.load(coords_path)
+                            elif cache["k"].shape[0] == x.coords.shape[0]:
+                                cache_coords = x.coords.detach().cpu()
+                            else:
+                                raise FileNotFoundError(
+                                    f"Missing SLAT TFSA coordinate cache: {coords_path}. "
+                                    "Regenerate the previous frame cache or use cache files saved with embedded coords."
+                                )
                             kv_feats = torch.cat([cache["k"][:, None], cache["v"][:, None]], dim=1).to(x.feats.device)
                             kv_coords = cache_coords.to(x.coords.device)
                             q = qkv.replace(qkv.feats[:, 0, :, :])
                             kv = SparseTensor(feats=kv_feats, coords=kv_coords)
-                            if kwargs.get("delete_loaded_tfsa_cache", False):
+                            if cache_mode == "memory" and memory_cache is not None and kwargs.get("rm_cache", False):
+                                memory_cache.pop(cache_key, None)
+                            elif kwargs.get("delete_loaded_tfsa_cache", False) and not kwargs.get("rm_cache", False):
                                 os.remove(cache_path)
             else:
                 qkv = self._linear(self.to_qkv, x)

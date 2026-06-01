@@ -6,6 +6,27 @@ from .full_attn import scaled_dot_product_attention
 import os
 from ...utils.morphing_utils import *
 
+
+def _use_modify_this_step(kwargs, step_idx: int) -> bool:
+    if not kwargs.get("modify", False):
+        return False
+    start = kwargs.get("modify_start_step", 0)
+    end = kwargs.get("modify_end_step", None)
+    stride = max(int(kwargs.get("modify_step_stride", 1)), 1)
+    if start is not None and step_idx < int(start):
+        return False
+    if end is not None and step_idx > int(end):
+        return False
+    return (int(step_idx) - int(start or 0)) % stride == 0
+
+
+def _gate_mode_this_step(kwargs, modify_this_step: bool) -> str:
+    gate_mode = kwargs.get("gate_mode", "logits")
+    if kwargs.get("gate_attn", False) and gate_mode == "logits" and not modify_this_step:
+        return kwargs.get("modify_skip_gate_mode", "post")
+    return gate_mode
+
+
 class MultiHeadRMSNorm(nn.Module):
     def __init__(self, dim: int, heads: int):
         super().__init__()
@@ -115,26 +136,34 @@ class MultiHeadAttention(nn.Module):
         return_score = kwargs.get("return_score", False)
         self_attn_kwargs = {}
         if self._type == "self" and kwargs.get("sa_use", False):
+            modify_this_step = _use_modify_this_step(kwargs, step_idx)
             self_attn_kwargs = {
-                "modify": kwargs.get("modify", False),
+                "modify": modify_this_step,
                 "gate_attn": kwargs.get("gate_attn", False),
-                "gate_mode": kwargs.get("gate_mode", "logits"),
+                "gate_mode": _gate_mode_this_step(kwargs, modify_this_step),
                 "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
                 "modify_max_passes": kwargs.get("modify_max_passes", 4),
                 "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
                 "modify_temperature": kwargs.get("modify_temperature", 1.0),
+                "modify_impl": kwargs.get("modify_impl", "legacy"),
+                "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
+                "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
                 "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
             }
         attn_kwargs = {}
         if self._type == "cross":
+            modify_this_step = _use_modify_this_step(kwargs, step_idx)
             attn_kwargs = {
-                "modify": kwargs.get("modify", False),
+                "modify": modify_this_step,
                 "gate_attn": kwargs.get("gate_attn", False),
-                "gate_mode": kwargs.get("gate_mode", "logits"),
+                "gate_mode": _gate_mode_this_step(kwargs, modify_this_step),
                 "modify_lambda_scale": kwargs.get("modify_lambda_scale", 0.3),
                 "modify_max_passes": kwargs.get("modify_max_passes", 4),
                 "modify_stop_conflict": kwargs.get("modify_stop_conflict", 0.5),
                 "modify_temperature": kwargs.get("modify_temperature", 1.0),
+                "modify_impl": kwargs.get("modify_impl", "legacy"),
+                "gate_entropy_threshold": kwargs.get("gate_entropy_threshold", 6.0),
+                "gate_max_logit_threshold": kwargs.get("gate_max_logit_threshold", 1.0),
                 "gate_qk_confidence_threshold": kwargs.get("gate_qk_confidence_threshold", 1.0),
             }
         if self._type == "self":
@@ -142,16 +171,31 @@ class MultiHeadAttention(nn.Module):
                 qkv = self.to_qkv(x)
                 qkv = qkv.reshape(B, L, 3, self.num_heads, -1)
                 if kwargs["ss_tfsa_flag"]:
+                    cache_mode = kwargs.get("tfsa_cache_mode", "disk")
+                    memory_cache = kwargs.get("_tfsa_memory_cache", None)
                     if cache_idx == 0:
-                        if not os.path.exists(f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt"):
-                            torch.save({"k": qkv[0, :, 1,  :, :].detach().cpu(), "v": qkv[0, :, 2,  :, :].detach().cpu()}, f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt")
+                        if kwargs.get("save_current_tfsa_cache", True):
+                            if cache_mode == "memory" and memory_cache is not None:
+                                memory_cache[("ss_sa", kwargs["morphing_idx"], step_idx, block_idx)] = {
+                                    "k": qkv[0, :, 1, :, :].detach().cpu(),
+                                    "v": qkv[0, :, 2, :, :].detach().cpu(),
+                                }
+                            elif not os.path.exists(f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt"):
+                                torch.save({"k": qkv[0, :, 1,  :, :].detach().cpu(), "v": qkv[0, :, 2,  :, :].detach().cpu()}, f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['morphing_idx']}_step{step_idx}_block{block_idx}.pt")
                     elif cache_idx == -1:
+                        cache = None
+                        cache_key = ("ss_sa", kwargs["tfsa_cache_idx"], step_idx, block_idx)
+                        if cache_mode == "memory" and memory_cache is not None:
+                            cache = memory_cache.get(cache_key)
                         cache_path = f"{kwargs['save_cache_path']}/ss_sa_morphing{kwargs['tfsa_cache_idx']}_step{step_idx}_block{block_idx}.pt"
-                        if os.path.exists(cache_path):
-                            cache = torch.load(cache_path)
+                        if cache is not None or os.path.exists(cache_path):
+                            if cache is None:
+                                cache = torch.load(cache_path)
                             qkv[:, :, 1, :, :] = cache["k"].to(qkv.device) 
                             qkv[:, :, 2, :, :] = cache["v"].to(qkv.device)
-                            if kwargs.get("delete_loaded_tfsa_cache", False):
+                            if cache_mode == "memory" and memory_cache is not None and kwargs.get("rm_cache", False):
+                                memory_cache.pop(cache_key, None)
+                            elif kwargs.get("delete_loaded_tfsa_cache", False) and not kwargs.get("rm_cache", False):
                                 os.remove(cache_path)
 
                 if self.use_rope:

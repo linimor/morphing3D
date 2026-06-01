@@ -97,7 +97,6 @@ class SparseSubdivide(nn.Module):
         n_coords = torch.cat([torch.zeros_like(n_coords[:, :1]), n_coords], dim=-1)
         factor = n_coords.shape[0]
         assert factor == 2 ** DIM
-        # print(n_coords.shape)
         new_coords = input.coords.clone()
         new_coords[:, 1:] *= 2
         new_coords = new_coords.unsqueeze(1) + n_coords.unsqueeze(0).to(new_coords.dtype)
@@ -107,4 +106,3 @@ class SparseSubdivide(nn.Module):
         out._scale = input._scale * 2
         out._spatial_cache = input._spatial_cache
         return out
-
